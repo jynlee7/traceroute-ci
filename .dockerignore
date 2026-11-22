@@ -1,0 +1,5 @@
+work/
+.git/
+output.jsonl
+*.tar.gz
+**/__pycache__

@@ -112,3 +112,44 @@ This step is deterministic, cheap, and can be tested in isolation against `score
 - What `kind` values exist, and how many sample commits fail nothing?
 - What are the total suite duration and the slowest single test? These set the k range and the worst-case cost.
 - Do failures ever spread across many dialect test files from one change? That decides how wide the dialect fallback should be.
+
+## Progress log
+
+### 2026-11-20: first working selector (measured on the sample, host run)
+- Per-test coverage map built from the pinned commit (`tools/coverage.sh`, `tools/build_map.py`), stored in `maps/impact.json.gz` (~770 KB).
+- `test_optimizer` and the TPC executor tests do their work in spawned process pools, which per-test coverage misses. Fixes:
+  - `test_optimizer` was re-run with a thread pool (`tools/coverage_optimizer.sh`).
+  - The pool's pickling path (`Expression.__reduce__` → `sqlglot/serde.py`) is mapped to every pool test.
+  - The TPC executor tests get proxy coverage from the in-process TPC tests plus all executor and planner code.
+- Sample: **192.3 s simulated, 0 misses**, against ~1,200 s for the starter kit.
+
+### 2026-11-21: research-driven rules (code only, not yet run)
+- `tests/test_docs.py` uses unittest `load_tests`, which pytest ignores, so docstring edits break nothing through doctests.
+- `tests/test_typing.py` reads every `sqlglot/typing/*.py` file directly → any typing change selects it.
+- Fixture loaders in `tests/helpers.py` drop empty lines and lines starting with `--` → `.sql` fixture edits limited to such lines select nothing.
+- A dialect is split across `sqlglot/{dialects,parsers,generators,typing,tokenizers}/<name>.py`. Class-body and module-level edits now take:
+  - coverage of the whole dialect family, including subclass dialects found through imports;
+  - the dialect's test file, plus tests that hold the dialect name as a string (`dialect="x"`, `write={"x": ...}`);
+  - coverage of every line naming the edited top-level class or its subclasses, and their `<lower>_sql` generator methods.
+- Lambdas in class tables (parser `FUNCTIONS`, etc.) use the line coverage of the lambda itself.
+- New or renamed methods select every caller of that name, because of overrides and generator lookup by name.
+- A module-level edit in a package `__init__.py` runs everything.
+- `changed_statement_lines` no longer widens an edit to a `def`/`class`/`if` header, which over-selected for small classes.
+- Coverage sets are built lazily to cut charged runtime CPU.
+- The static index (`tools/build_index.py`) is built in `docker build`, where CPU is not charged. If it fails, the build still succeeds with an empty index, and the selector falls back to file coverage.
+
+**Next:** run `tools/eval.sh` and `make sample` to measure these changes, then commit and make the repo public.
+
+### 2026-11-21 (later): 20-agent research merged (code only, not yet run)
+All 20 reports are in `research/`. Merged into `selector.py`, `tools/build_index.py`, `tools/build_map.py`, `tools/fetch_src.py` and `Dockerfile`:
+- **Recall:**
+  - lambda-adjacent table insertions; import-time, class-creation and run-once functions; functions that ran only during import;
+  - test-module import graph (Validator), sqlglot names imported by tests, removed names imported internally;
+  - tests that loop over every dialect, dialects named in fixture headers, `"x, k=v"` dialect strings;
+  - SQL-name map for auto-registered Func classes; renames, binary files, unparseable patches; byte-level comment hazards.
+- **Cost:**
+  - LPT plus improvement split; docstring-only edits select nothing; `sqlglotc/` routing;
+  - slow-test pruning, limited to same-indent replacements on recorded lines; TPC-H proxy dropped; memoisation.
+- **Build:** no apt or git (GitHub archive fetch); the index build can't fail the image; a bad map runs everything.
+
+**Next:** rebuild the map → `tools/eval.sh` → `make sample` → fix → commit → make the repo public. Deferred: agent 13 bake (CPU), agent 01 parser-table narrowing, agent 14 coverage re-runs (import flag, setUpClass broadcast, reversed-order run).
