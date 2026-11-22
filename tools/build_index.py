@@ -489,7 +489,7 @@ def build(root: Path) -> dict:
                     qualified_attrs.setdefault(f"{owner}.{n.attr}", set()).add(rel)
 
     extra: dict = {"qualified_attrs": {k: sorted(v) for k, v in qualified_attrs.items()}}
-    for part in (eq_tables, construct_tables):
+    for part in (eq_tables, construct_tables, attr_read_tables):
         try:
             extra.update(part(root, trees, all_dialect_tests))
         except Exception as e:  # optional tables: the selector refuses the rules that need them
@@ -734,6 +734,211 @@ def construct_tables(root: Path, trees: dict, all_dialect_tests) -> dict:
         "gen_init_attrs": sorted(gen_attrs),
         "construct_only_tests": construct_only,
     }
+
+
+CONST_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def attr_read_tables(root: Path, trees: dict, _all_dialect_tests) -> dict:
+    """Where class constants are read, for the value-reader rule (selector.value_readers):
+      attr_reads  NAME -> [[file, line, where, owner, keyonly]] for every load of a class constant
+                  (UPPER_CASE name assigned in some class body):
+                  where   "fn" inside a def or lambda body (runs when called), "top" otherwise
+                          (module level or class body: runs at import), "dyn" for a string
+                          equal to NAME (getattr-style access)
+                  owner   the name the attribute is read from ("self", "dialect", "MySQLParser"),
+                          or "class:<C>" for a bare NAME read inside class C's body
+                  keyonly 1 when only the keys can matter: iterated, tested with `in`, .keys(), len()
+      test_attr_users  NAME -> test ids whose source reads .NAME or holds the string "NAME"
+    """
+    consts: set[str] = set()
+    for tree in trees.values():
+        for c in ast.walk(tree):
+            if isinstance(c, ast.ClassDef):
+                for s in c.body:
+                    for tg in (s.targets if isinstance(s, ast.Assign) else [s.target] if isinstance(s, ast.AnnAssign) else []):
+                        if isinstance(tg, ast.Name) and CONST_NAME.match(tg.id):
+                            consts.add(tg.id)
+    reads: dict[str, list] = {}
+    hops: set[str] = set()
+
+    def keyonly(node, parents) -> int:
+        if direct_keyonly(node, parents):
+            return 1
+        # numeric_escapes = klass.tokenizer_class.NUMERIC_ESCAPES; ... "x" in numeric_escapes:
+        # a local alias whose every use (in the same function) only looks at keys.
+        p = parents.get(id(node))
+        if isinstance(p, ast.Assign) and p.value is node and len(p.targets) == 1 and isinstance(p.targets[0], ast.Name):
+            name, fn = p.targets[0].id, p
+            while fn is not None and not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                fn = parents.get(id(fn))
+            if fn is None:
+                return 0
+            uses = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == name]
+            loads = [n for n in uses if isinstance(n.ctx, ast.Load)]
+            stores = [n for n in uses if not isinstance(n.ctx, ast.Load)]
+            if len(stores) == 1 and loads and all(direct_keyonly(n, parents) for n in loads):
+                return 1
+        return 0
+
+    def direct_keyonly(node, parents) -> int:
+        p = parents.get(id(node))
+        if isinstance(p, ast.comprehension) and p.iter is node:
+            return 1
+        if isinstance(p, ast.For) and p.iter is node:
+            return 1
+        if isinstance(p, ast.Compare) and node in p.comparators and \
+                all(isinstance(op, (ast.In, ast.NotIn)) for op in p.ops):
+            return 1
+        if isinstance(p, ast.Attribute) and p.attr == "keys":
+            return 1
+        if isinstance(p, ast.Call) and getattr(p.func, "id", "") == "len" and node in p.args:
+            return 1
+        return 0
+
+    for rel, tree in trees.items():
+        parents = {}
+        for p in ast.walk(tree):
+            for ch in ast.iter_child_nodes(p):
+                parents[id(ch)] = p
+
+        def handle(ch, in_fn: bool, cls: str | None) -> None:
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # decorators and defaults run at definition time, the body when called
+                for d in ch.decorator_list + ch.args.defaults + [x for x in ch.args.kw_defaults if x]:
+                    handle(d, in_fn, cls)
+                for st in ch.body:
+                    handle(st, True, None)
+            elif isinstance(ch, ast.Lambda):
+                for d in ch.args.defaults:
+                    handle(d, in_fn, cls)
+                handle(ch.body, True, None)
+            elif isinstance(ch, ast.ClassDef):
+                for b in ch.bases + ch.decorator_list + [k.value for k in ch.keywords]:
+                    handle(b, in_fn, cls)
+                for st in ch.body:
+                    handle(st, in_fn, None if in_fn else ch.name)
+            else:
+                record(ch, in_fn, cls)
+                for sub in ast.iter_child_nodes(ch):
+                    handle(sub, in_fn, cls)
+
+        def visit(node, in_fn: bool, cls: str | None) -> None:
+            for ch in ast.iter_child_nodes(node):
+                handle(ch, in_fn, cls)
+
+        def stmt_line(n) -> int:
+            """Coverage records a statement on its first line: the read's enclosing statement."""
+            cur = n
+            while cur is not None and not isinstance(cur, ast.stmt):
+                if isinstance(parents.get(id(cur)), ast.Lambda):
+                    return cur.lineno  # a lambda body is recorded where it sits, when called
+                cur = parents.get(id(cur))
+            return cur.lineno if cur is not None else n.lineno
+
+        def record(n, in_fn, cls) -> None:
+            if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and n.attr in consts:
+                v = n.value
+                owner = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else ""
+                entry = [rel, stmt_line(n), "fn" if in_fn else "top", owner, keyonly(n, parents)]
+                kw = parents.get(id(n))
+                if in_fn and isinstance(kw, ast.keyword) and kw.arg:
+                    entry.append(kw.arg)  # passed on as kw.arg=...: its real readers are downstream
+                    hops.add(kw.arg)
+                reads.setdefault(n.attr, []).append(entry)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in consts and cls and not in_fn:
+                reads.setdefault(n.id, []).append([rel, stmt_line(n), "top", f"class:{cls}", keyonly(n, parents)])
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in consts:
+                reads.setdefault(n.value, []).append([rel, n.lineno, "dyn", "", 0])
+
+        visit(tree, False, None)
+
+    # Downstream readers of a keyword argument K (one hop): loads of `.K` (stored as self.K by the
+    # callee), loads of a parameter named K, and "dyn" for the string "K" (kwargs["K"], getattr).
+    hop_reads: dict[str, list] = {}
+    for rel, tree in trees.items():
+        parents = {}
+        for p in ast.walk(tree):
+            for ch in ast.iter_child_nodes(p):
+                parents[id(ch)] = p
+        def start(n) -> int:
+            cur = n
+            while cur is not None and not isinstance(cur, ast.stmt):
+                if isinstance(parents.get(id(cur)), ast.Lambda):
+                    return cur.lineno
+                cur = parents.get(id(cur))
+            return cur.lineno if cur is not None else n.lineno
+
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                params = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs} & hops
+                for n in ast.walk(fn):
+                    if isinstance(n, ast.Name) and n.id in params and isinstance(n.ctx, ast.Load):
+                        p = parents.get(id(n))
+                        if isinstance(p, ast.Assign) and p.value is n and all(
+                                isinstance(tg, ast.Attribute) and tg.attr == n.id for tg in p.targets):
+                            continue  # self.K = K: a pass-through, read later as .K (recorded below)
+                        hop_reads.setdefault(n.id, []).append([rel, start(n), "fn"])
+        slot_strings = set()
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Assign, ast.AnnAssign)) and any(
+                    isinstance(tg, ast.Name) and tg.id == "__slots__"
+                    for tg in (n.targets if isinstance(n, ast.Assign) else [n.target])) and n.value is not None:
+                slot_strings |= {id(c) for c in ast.walk(n.value)}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and n.attr in hops and isinstance(n.ctx, ast.Load):
+                cur = n
+                while cur is not None and not isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    cur = parents.get(id(cur))
+                p = parents.get(id(n))
+                if cur is not None and not isinstance(cur, ast.Lambda) and isinstance(p, ast.Assign) and p.value is n \
+                        and len(p.targets) == 1 and isinstance(p.targets[0], ast.Name):
+                    # local = self.K: the value is used only where the local is loaded; any test using
+                    # it ran one of those lines (each runs after the assignment, in the same call).
+                    name = p.targets[0].id
+                    uses = [x for x in ast.walk(cur) if isinstance(x, ast.Name) and x.id == name]
+                    if sum(not isinstance(x.ctx, ast.Load) for x in uses) == 1:
+                        for x in uses:
+                            if isinstance(x.ctx, ast.Load):
+                                hop_reads.setdefault(n.attr, []).append([rel, start(x), "fn"])
+                        continue
+                hop_reads.setdefault(n.attr, []).append([rel, start(n), "fn" if cur is not None else "top"])
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in hops and id(n) not in slot_strings:
+                hop_reads.setdefault(n.value, []).append([rel, n.lineno, "dyn"])
+
+    dialect_dirs = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/tokenizers/", "sqlglot/typing/")
+    dialect_classes = {c.name for rel, tree in trees.items() if rel.startswith(dialect_dirs)
+                       for c in tree.body if isinstance(c, ast.ClassDef)}
+    users: dict[str, set] = {}
+    idents: dict[str, set] = {}  # dialect-file class name -> tests naming it in code
+    for rel, tree in _parse_tests(root).items():
+        # A dialect class named in module-level code (imports excluded: an unused import runs nothing)
+        # reaches every test of the module, e.g. DIALECT = TSQL() used inside the tests.
+        mod_idents = {n.id if isinstance(n, ast.Name) else n.attr
+                      for st in tree.body if not isinstance(st, (ast.FunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom))
+                      for n in ast.walk(st) if isinstance(n, (ast.Name, ast.Attribute))} & dialect_classes
+        for node in tree.body:
+            units = []
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test"):
+                units.append((f"{rel}::{node.name}", [node]))
+            elif isinstance(node, ast.ClassDef):
+                helpers = [i for i in node.body if isinstance(i, ast.FunctionDef) and not i.name.startswith("test")]
+                units += [(f"{rel}::{node.name}::{i.name}", [i] + helpers) for i in node.body
+                          if isinstance(i, ast.FunctionDef) and i.name.startswith("test")]
+            for tid, nodes in units:
+                for nd in nodes:
+                    for n in ast.walk(nd):
+                        name = n.attr if isinstance(n, ast.Attribute) else \
+                            n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
+                        if name in consts:
+                            users.setdefault(name, set()).add(tid)
+                        ident = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+                        if ident in dialect_classes:
+                            idents.setdefault(ident, set()).add(tid)
+            for ident in mod_idents:
+                idents.setdefault(ident, set()).update(t for t, _ in units)
+    return {"attr_reads": reads, "hop_reads": hop_reads, "test_attr_users": {k: sorted(v) for k, v in users.items()},
+            "test_idents": {k: sorted(v) for k, v in idents.items()}}
 
 
 def main() -> None:

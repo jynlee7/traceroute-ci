@@ -170,3 +170,17 @@ Plan: `research/r2/PLAN.md` (22 reports in `research/r2/`). Changes:
 - Expected on the sample: ~217.7 -> ~130-140 s simulated (Tier 2 is needed for ~115 s). Not measured.
 
 **Next:** rebuild the map (`python tools/build_map.py`, for R2) → `tools/eval.sh` → `make sample` → confirm 0 misses and check the `why.log` reasons (`is-*-swap`, `module-safe`, `fixture-name`, `def-header`).
+
+### 2026-11-22: Tier 2 implemented and measured
+- **P1 `value_edit`:** class-constant literal edits select the coverage of the constant's runtime readers (index `attr_reads`), intersected with the dialect family's users, plus tests that read the constant in their own code.
+  - It gives up (falls back to the import-time rule) on reads at import time, `getattr`-style string reads, and dict-key changes.
+  - Reads that only look at keys (`in`, iteration, `len`, `.keys()`, including through one local alias) are ignored when only dict values changed.
+  - It follows one keyword-argument hop (`TokenizerCore(numeric_escapes=...)` → `.numeric_escapes` loads → the local alias's uses).
+- **P2:** `arg_types` value flips select `class_tests` + `sql_name_tests` of the class, not whole-file coverage.
+- **P3 `dead_edit`:** a same-indent replacement of a statement that never ran (inside a function that did run, in a dialect-specific file, typing/ excluded) with an unchanged `symtable` scope signature selects nothing.
+- **P5:** new-name callers count only class methods and module functions; in dialect files they are limited to that dialect's users.
+- Skipped:
+  - P4: worth ~1 s once P1 is in.
+  - P6: zero sample gain, adds risk.
+  - P7: needs per-test fixture-half knowledge that can't be derived without naming tests.
+- Measured, `make sample`: **116.3 s simulated, 0 misses** (132.5 after Tier 1), CPU 1.46 s under amd64 emulation.

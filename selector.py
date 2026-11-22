@@ -593,6 +593,171 @@ class Selector:
                 node = p
         return True
 
+    def dialect_users(self, rel: str) -> set[int]:
+        """Tests that can use the dialect `rel` belongs to (or a subclass of it): they run its code,
+        name it (strings, fixture headers, test file), name its classes in code, or loop over all
+        dialects."""
+        family = self.dialect_family(rel)
+        memo = self.__dict__.setdefault("_users_memo", {})
+        key = frozenset(family)
+        if key not in memo:
+            out: set[int] = set()
+            for f2 in family:
+                out |= self.file_cov(f2)
+            out |= self.name_tests({Path(f2).stem for f2 in family} - {"__init__", "base"})
+            idents = self.index.get("test_idents", {})
+            for f2 in family:
+                for start, end, name in self.index.get("toplevel", {}).get(f2, []):
+                    out |= {self.by_id[t] for t in idents.get(name, ()) if t in self.by_id}
+            out |= {self.by_id[t] for t in self.index.get("all_dialect_tests", ()) if t in self.by_id}
+            memo[key] = frozenset(out)
+        return set(memo[key])
+
+    def value_edit(self, old_tree, new_tree, rel: str) -> tuple[set[int], str] | None:
+        """The edit only changes literal values held by class attributes: the tests that read them.
+
+        P1, a class constant (UPPER_CASE): coverage of every runtime line reading that attribute
+        name (index attr_reads), plus tests reading it in their own code. Gives up (None: use the
+        import-time rule) when a reader runs at import (class body, module level, metaclass or
+        other import-time function) unless it only looks at the keys of a dict whose values
+        changed, or when the name is read through a string (getattr). Reads from an unrelated
+        class (MySQLParser.SHOW_PARSERS while editing SingleStoreParser's) don't count. In a
+        dialect file the result is limited to tests that use that dialect family.
+        P2, an Expression's arg_types values (required flags): the tests that build or parse
+        that class (its references and SQL names), not the whole file's coverage.
+        """
+        ix = self.index
+        if "attr_reads" not in ix or "closure_factories" not in ix:
+            return None
+        diffs = leaf_diffs(old_tree, new_tree)
+        if not diffs or any(d[0] != "const" for d in diffs):
+            return None
+        parents = {}
+        for p in ast.walk(old_tree):
+            for c in ast.iter_child_nodes(p):
+                parents[id(c)] = p
+        factories = set(ix["closure_factories"])
+        edits: set[tuple[str, str, bool]] = set()  # (class, attribute, only dict values changed)
+        for _, a, b in diffs:
+            if type(a.value) is not type(b.value):
+                return None
+            node, in_value = a, False
+            while True:
+                p = parents.get(id(node))
+                if p is None:
+                    return None
+                if isinstance(p, ast.Dict):
+                    if any(k is node for k in p.keys):
+                        return None
+                    in_value = True
+                elif isinstance(p, ast.Call):
+                    if node is p.func or call_name(p) not in factories:
+                        return None
+                elif isinstance(p, ast.UnaryOp):
+                    if not isinstance(p.op, (ast.USub, ast.UAdd)):
+                        return None
+                elif isinstance(p, (ast.Assign, ast.AnnAssign)):
+                    holder = parents.get(id(p))
+                    targets = p.targets if isinstance(p, ast.Assign) else [p.target]
+                    if not isinstance(holder, ast.ClassDef) or len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                        return None
+                    edits.add((holder.name, targets[0].id, in_value))
+                    break
+                elif not isinstance(p, (ast.List, ast.Tuple, ast.Set, ast.keyword)):
+                    return None
+                node = p
+        if not edits:
+            return None
+        if all(attr == "arg_types" and in_value for _, attr, in_value in edits) and rel.startswith("sqlglot/expressions/"):
+            out: set[int] = set()
+            for cls, _, _ in edits:
+                out |= self.class_tests(cls)
+                by_name = self.sql_name_tests(cls, set())
+                if by_name is None:
+                    return None
+                out |= by_name
+            return (out, "arg-types") if out else None
+        if not all(CONST_NAME.match(attr) for _, attr, _ in edits):
+            return None
+        subs_all = ix.get("class_subs", {})
+        known = ix.get("class_bases", {})
+        out = set()
+        for cls, attr, in_value in edits:
+            family, todo = set(), [cls]
+            while todo:
+                n = todo.pop()
+                if n not in family:
+                    family.add(n)
+                    todo.extend(subs_all.get(n, ()))
+            reads = ix["attr_reads"].get(attr)
+            if not reads:
+                return None
+            lines: dict[str, set[int]] = {}
+            expanded = []
+            for r in reads:
+                if len(r) > 5 and not r[4]:
+                    # Passed on as a keyword argument (TokenizerCore(numeric_escapes=self.NUMERIC_ESCAPES)):
+                    # the call runs on every use; the readers are the callee's parameter and `.K` loads.
+                    downstream = ix.get("hop_reads", {}).get(r[5])
+                    if not downstream or r[2] != "fn" or self.in_import_fn(r[0], r[1]):
+                        return None  # untraceable, or the call itself runs at import
+                    expanded += [[f2, line, where, "", 0] for f2, line, where in downstream]
+                else:
+                    expanded.append(r[:5])
+            for f2, line, where, owner, keyonly in expanded:
+                if owner.startswith("class:"):
+                    if owner[6:] not in family:
+                        continue  # a bare name in another class's body is that class's own attribute
+                elif owner in known and owner not in family:
+                    continue  # read from an unrelated class
+                if where == "dyn":
+                    return None
+                if keyonly and in_value:
+                    continue  # only the dict's keys are looked at, and only values changed
+                if where != "fn" or self.in_import_fn(f2, line):
+                    return None  # read at import: its effect is credited to whichever test came first
+                lines.setdefault(f2, set()).add(line)
+            hit: set[int] = set()
+            for f2, lns in lines.items():
+                hit |= self.cov(f2, lns)
+            if rel.startswith(DIALECT_DIRS):
+                hit &= self.dialect_users(rel)
+            hit |= {self.by_id[t] for t in ix.get("test_attr_users", {}).get(attr, ()) if t in self.by_id}
+            out |= hit
+        return out, "value-readers"
+
+    def dead_edit(self, f: dict, old_tree, new_tree, rel: str, ln: int, fn: tuple[int, int]) -> bool:
+        """The changed statement never ran in any test or at import, inside a function that did run,
+        and the edit changes no name's scope: no test can observe it (P3). Only for files whose
+        coverage is direct (dialect-specific modules, typing/ excluded: test_typing reads source),
+        and only for one-for-one same-indent line replacements."""
+        if not rel.startswith(DIALECT_DIRS) or rel.startswith("sqlglot/typing/") or Path(rel).stem in ("__init__", "base"):
+            return False
+        table = self.files.get(rel, {}).get("lines", {})
+        if not table or not any(str(x) in table for x in range(fn[0], fn[1] + 1)):
+            return False  # unmeasured file, or a function that never ran: no proof
+        stmt = None
+        for node in ast.walk(old_tree):
+            if isinstance(node, ast.stmt) and node.lineno <= ln <= (node.end_lineno or node.lineno):
+                body = getattr(node, "body", None)
+                head_end = body[0].lineno - 1 if body and getattr(body[0], "lineno", None) else node.end_lineno
+                if node.lineno <= ln <= head_end and (stmt is None or node.lineno >= stmt.lineno):
+                    stmt = node
+        if stmt is None or isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False
+        if str(stmt.lineno) in table:
+            return False  # it ran (or is recorded): not dead
+        memo = self.__dict__.setdefault("_scope_memo", {})
+        key = id(f)
+        if key not in memo:
+            try:
+                old_src = self.source(f["old"]) or ""
+                new_src = apply_patch(old_src, f) or ""
+                memo[key] = scope_signature(old_src, rel) == scope_signature(new_src, rel)
+            except Exception:
+                memo[key] = False
+        return memo[key]
+
     # -- per kind of file
 
     def python_change(self, f: dict) -> tuple[set[int], str]:
@@ -659,6 +824,14 @@ class Selector:
             for c in old_names.keys() | new_names_.keys():
                 if old_names.get(c) != new_names_.get(c):
                     renamed |= old_names.get(c, set()) | new_names_.get(c, set())
+        if not any(self.innermost(rel, ln)[0] for ln in changed):
+            # Only class bodies / module level changed: literal value edits go to their readers.
+            ve = self.value_edit(old_tree, new_tree, rel)
+            if ve is not None:
+                hit, why = ve
+                if rel.startswith("sqlglot/typing/"):
+                    hit |= self.by_file.get(TYPING_TEST, set())
+                return hit, "sqlglot:" + why
         headers = def_headers(old_tree)
         safe = None  # import_safe(), computed on first module-level line
         out: set[int] = set()
@@ -684,6 +857,8 @@ class Selector:
                     return set(self.all), "import-fn-unmapped"
                 out |= hit
                 reasons.append("import-fn")
+            elif fn and ln in prunable and self.dead_edit(f, old_tree, new_tree, rel, ln, fn):
+                reasons.append("dead")
             elif fn:
                 lo, hi = max(fn[0], ln - WINDOW), min(fn[1], ln + WINDOW)
                 hit = self.cov(rel, range(lo, hi + 1))
@@ -762,11 +937,16 @@ class Selector:
         for owner, n in class_bound(old_tree) - class_bound(new_tree):
             if any(f2 != rel for f2 in qualified.get(f"{owner}.{n}", ())):
                 return set(self.all), "sqlglot:lost-class-attr"
-        new_names = def_names(new_tree) - def_names(old_tree)
+        new_names = def_names(new_tree, nested=False) - def_names(old_tree, nested=False)
         if new_names:
             # A new or renamed method can override a parent's or be found by name
             # (generators look up `<lower expression>_sql`): take every caller of that name.
-            out |= self.new_method_tests(new_names)
+            # Nested helpers are local to their function (its own lines already count). In a
+            # dialect file only that dialect's users can reach the override.
+            hit = self.new_method_tests(new_names)
+            if rel.startswith(DIALECT_DIRS) and Path(rel).stem not in ("__init__", "base"):
+                hit &= self.dialect_users(rel)
+            out |= hit
             reasons.append("new-def")
         if rel.startswith("sqlglot/typing/"):
             out |= self.by_file.get(TYPING_TEST, set())
@@ -906,6 +1086,28 @@ def leaf_diffs(a, b) -> list[tuple] | None:
     return out
 
 
+CONST_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def scope_signature(src: str, rel: str) -> list:
+    """Every scope's kind, name, generator/async flags and each symbol's binding kind: two sources
+    with equal signatures resolve every name the same way (no new local, global or free name)."""
+    import symtable
+
+    out = []
+
+    def walk(tab) -> None:
+        syms = sorted((s.get_name(), s.is_local(), s.is_global(), s.is_free(), s.is_parameter(),
+                       s.is_nonlocal(), s.is_imported(), s.is_assigned()) for s in tab.get_symbols())
+        flags = (tab.get_type(), tab.get_name(), getattr(tab, "is_nested", lambda: None)())
+        out.append((flags, syms))
+        for ch in tab.get_children():
+            walk(ch)
+
+    walk(symtable.symtable(src, rel, "exec"))
+    return out
+
+
 def call_name(c: ast.Call) -> str | None:
     fn = c.func
     return fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
@@ -1007,8 +1209,9 @@ def module_bound(tree) -> set[str]:
     return out
 
 
-def def_names(tree) -> set[tuple[str, str]]:
-    """(enclosing class, function name) of every def, at any depth."""
+def def_names(tree, nested: bool = True) -> set[tuple[str, str]]:
+    """(enclosing class, function name) of every def, at any depth; with nested=False only module
+    functions and class methods (not defs inside a function body)."""
     out: set[tuple[str, str]] = set()
     if tree is None:
         return out
@@ -1019,7 +1222,8 @@ def def_names(tree) -> set[tuple[str, str]]:
                 visit(child, child.name)
             elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 out.add((cls, child.name))
-                visit(child, cls)
+                if nested:
+                    visit(child, cls)
             else:
                 visit(child, cls)
 
