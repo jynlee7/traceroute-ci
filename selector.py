@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,9 +20,15 @@ APP = Path(os.environ.get("APP", "/app"))
 SRC = Path(os.environ.get("SRC", APP / "src"))  # sqlglot checkout at the pinned commit
 MAP = Path(os.environ.get("MAP", APP / "maps/impact.json.gz"))
 INDEX = Path(os.environ.get("INDEX", APP / "maps/index.json"))  # built by tools/build_index.py
+FAST = Path(os.environ.get("FAST", APP / "maps/fast.marshal"))  # selector.py --bake, at build time
 
 # A dialect lives in one file per directory, all named after it.
 DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/", "sqlglot/tokenizers/")
+TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPC_PROBE = Path(os.environ.get("TPC_PROBE", APP / "tools/tpc_probe.py"))
+TPC_BASE = Path(os.environ.get("TPC_BASE", APP / "maps/tpc_base.json"))  # tpc_probe.py on the pinned sources
+EXEC_BUDGET_S = 4.0  # tools/tpc_probe.py EXEC_BUDGET: query executions it may add
+PICKLE_FNS = ("__reduce__", "__reduce_ex__", "__getstate__", "__setstate__")
 TYPING_TEST = "tests/test_typing.py"  # reads every sqlglot/typing/*.py file directly
 
 WORKER_MS = 2000
@@ -189,6 +196,43 @@ def apply_patch(old: str, f: dict) -> str | None:
 # ---------------------------------------------------------------- selection
 
 
+# Files whose constructions get validated against arg_types (see value_edit, P2).
+VALIDATING = ("sqlglot/parser.py", "sqlglot/parsers/", "sqlglot/dialects/", "sqlglot/expressions/builders.py")
+
+
+def load_maps() -> tuple[dict, dict]:
+    """(coverage map, static index). FAST is a marshal snapshot of both, written at build time by
+    `selector.py --bake` with the same interpreter (marshal is version-specific); it loads in
+    about half the time of gzip+JSON. Any problem with it falls back to the JSON files."""
+    try:
+        import marshal
+        m, index = marshal.loads(FAST.read_bytes())
+        if isinstance(m, dict) and "sets" in m and isinstance(index, dict):
+            return m, index
+    except Exception as e:  # noqa: BLE001
+        log(f"no fast map ({type(e).__name__}); reading JSON")
+    with gzip.open(MAP, "rt") as fh:
+        m = json.load(fh)
+    try:
+        index = json.loads(INDEX.read_text())
+    except Exception as e:  # noqa: BLE001
+        log(f"no index ({type(e).__name__}); import-time rules use file coverage only")
+        index = {}
+    return m, index
+
+
+def bake() -> None:
+    """Build step: write FAST from the JSON map and index (run after build_index.py)."""
+    import marshal
+    with gzip.open(MAP, "rt") as fh:
+        m = json.load(fh)
+    try:
+        index = json.loads(INDEX.read_text())
+    except Exception:  # noqa: BLE001 - same fallback the runtime would take
+        index = {}
+    FAST.write_bytes(marshal.dumps((m, index)))
+
+
 class Selector:
     def __init__(self, tests: list[dict]):
         self.tests = tests
@@ -198,8 +242,7 @@ class Selector:
         self.by_file: dict[str, set[int]] = {}
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
-        with gzip.open(MAP, "rt") as fh:
-            m = json.load(fh)
+        m, index = load_maps()
         # Map test indexes in the map onto this run's numbers, by id.
         number_of = [self.by_id.get(tid) for tid in m["tests"]]
         self._number_of = number_of
@@ -207,15 +250,8 @@ class Selector:
         self._sets: dict[int, frozenset] = {}  # built on first use: a run touches few of them
         self.files = m["files"]
         self.strings = {number_of[int(k)]: v for k, v in m["test_strings"].items() if number_of[int(k)] is not None}
-        self.string_sets = {n: frozenset(v) for n, v in self.strings.items()}
-        self.string_heads = {n: frozenset(s.split(",", 1)[0].strip() for s in v if "," in s and "=" in s)
-                             for n, v in self.strings.items()}
         self._src_cache: dict[str, str | None] = {}
-        try:
-            self.index = json.loads(INDEX.read_text())
-        except Exception as e:
-            log(f"no index ({type(e).__name__}); import-time rules use file coverage only")
-            self.index = {}
+        self.index = index
 
     def source(self, rel: str) -> str | None:
         if rel not in self._src_cache:
@@ -259,6 +295,28 @@ class Selector:
                     cls = (start, end)
         return fn, cls
 
+    def _string_index(self, attr: str, key) -> dict[str, set[int]]:
+        """key(string) -> tests holding such a string; built once, on first use."""
+        idx = self.__dict__.get(attr)
+        if idx is None:
+            idx = {}
+            for n, strings in self.strings.items():
+                for s in strings:
+                    idx.setdefault(key(s), set()).add(n)
+            self.__dict__[attr] = idx
+        return idx
+
+    def _head_index(self) -> dict[str, set[int]]:
+        idx = self.__dict__.get("_by_head")
+        if idx is None:
+            idx = {}
+            for n, strings in self.strings.items():
+                for s in strings:
+                    if "," in s and "=" in s:
+                        idx.setdefault(s.split(",", 1)[0].strip(), set()).add(n)
+            self._by_head = idx
+        return idx
+
     def name_tests(self, words: set[str]) -> set[int]:
         """Tests in test files named after any word, e.g. snowflake -> tests/dialects/test_snowflake.py,
         plus tests holding the word as a whole string, e.g. dialect="snowflake" or write={"snowflake": ...}."""
@@ -268,9 +326,12 @@ class Selector:
                 if Path(f).stem == f"test_{w}":
                     out |= nums
         if words:
-            out |= {n for n, s in self.string_sets.items() if not s.isdisjoint(words)}
-            # Dialect strings with settings: "duckdb, version=1.0".
-            out |= {n for n, heads in self.string_heads.items() if not heads.isdisjoint(words)}
+            by_string = self._string_index("_by_string", lambda s: s)
+            by_head = self._head_index()
+            for w in words:
+                out |= by_string.get(w, set())
+                # Dialect strings with settings: "duckdb, version=1.0".
+                out |= by_head.get(w, set())
             # Fixture-driven tests name their dialect in "# dialect: x" headers, not in Python.
             fixture_dialects = self.index.get("fixture_dialects", {})
             for w in words:
@@ -301,8 +362,12 @@ class Selector:
                 return name
         return None
 
-    def class_tests(self, name: str) -> set[int]:
-        """Coverage of every line naming the class or a subclass, and of their `<lower>_sql` methods."""
+    def class_tests(self, name: str, where: tuple[str, ...] | None = None) -> set[int] | None:
+        """Coverage of every line naming the class or a subclass, and of their `<lower>_sql` methods.
+
+        With `where`, only references in files starting with those prefixes count, and None is
+        returned when one of them sits outside any function (a table built at import: coverage
+        credits it to whichever test came first, so it says nothing about its users)."""
         subs, refs = self.index.get("subs", {}), self.index.get("refs", {})
         names, todo = set(), [name]
         while todo:
@@ -315,6 +380,11 @@ class Selector:
         out: set[int] = set()
         for n in names:
             for rel, start, end in refs.get(n, []):
+                if where is not None:
+                    if not rel.startswith(where):
+                        continue
+                    if not self.innermost(rel, start)[0] or self.in_import_fn(rel, start):
+                        return None
                 out |= self.cov(rel, range(start, end + 1))
         return out
 
@@ -348,7 +418,8 @@ class Selector:
         if fixture_rel not in memo:
             path = Path(fixture_rel)
             name, stem, parent = path.name, path.stem, path.parent.name
-            hits = {n for n, strings in self.strings.items() if any(s.rsplit("/", 1)[-1] in (name, stem) for s in strings)}
+            by_tail = self._string_index("_by_tail", lambda s: s.rsplit("/", 1)[-1])
+            hits = by_tail.get(name, set()) | by_tail.get(stem, set())
             how = "fixture-name"
             if not hits:
                 hits = {n for n, strings in self.strings.items() if any(stem in s for s in strings)}
@@ -359,6 +430,36 @@ class Selector:
             memo[fixture_rel] = (frozenset(hits), how)
         hits, how = memo[fixture_rel]
         return set(hits), how
+
+    def setup_fixture_readers(self, f: dict) -> set[int] | None:
+        """A fixture a test class loads in setUpClass into a class attribute (index setup_fixtures):
+        only the tests using that attribute read it. The loaders split text on ";" and parse "#"
+        meta lines; a "#" line without ":" raises inside setUpClass and errors the whole class, so
+        an edit touching any line starting with "#" is not narrowed. Tests naming the file in their
+        own code still count."""
+        table = self.index.get("setup_fixtures")
+        if not table:
+            return None
+        for h in f["hunks"]:
+            for tag, text, _ in h["lines"]:
+                if tag in ("+", "-") and text.lstrip().startswith("#"):
+                    return None
+        path = f["path"]
+        keys = [k for k in table if path.endswith(k.lstrip("/"))]
+        if not keys:
+            return None
+        out = {self.by_id[t] for k in keys for t in table[k] if t in self.by_id}
+        if not out:
+            return None
+        # Other tests that name the file outside that class helper (their own strings) still read it.
+        name = Path(path).name
+        class_of = {t.rsplit("::", 1)[0] for k in keys for t in table[k]}
+        by_tail = self._string_index("_by_tail", lambda s: s.rsplit("/", 1)[-1])
+        for n in by_tail.get(name, set()) | by_tail.get(Path(path).stem, set()):
+            tid = self.tests[n]["id"] if n < len(self.tests) else ""
+            if tid.rsplit("::", 1)[0] not in class_of:
+                out.add(n)
+        return out
 
     def fixture_tests(self, fixture_rel: str) -> set[int]:
         return self.fixture_readers(fixture_rel)[0]
@@ -506,14 +607,14 @@ class Selector:
         if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name) and expr.value.id == "self":
             ann = ix.get("attr_ann", {}).get(f"{rel}:{expr.attr}")
         elif isinstance(expr, ast.Name):
-            for fn in ast.walk(tree):
+            for fn in walk(tree):
                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.lineno <= expr.lineno <= fn.end_lineno:
                     for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs:
                         if a.arg == expr.id:
                             ann = ast.unparse(a.annotation) if a.annotation is not None else None
                             # A rebinding anywhere in the function voids the annotation as a proof.
                             if any(isinstance(n, ast.Name) and n.id == expr.id and isinstance(n.ctx, ast.Store)
-                                   for n in ast.walk(fn)):
+                                   for n in walk(fn)):
                                 return False
         if not ann:
             return False
@@ -552,7 +653,7 @@ class Selector:
         if not diffs or any(d[0] != "const" for d in diffs):
             return False
         parents = {}
-        for p in ast.walk(old_tree):
+        for p in walk(old_tree):
             for c in ast.iter_child_nodes(p):
                 parents[id(c)] = p
         factories, gen_attrs = set(ix["closure_factories"]), set(ix["gen_init_attrs"])
@@ -633,7 +734,7 @@ class Selector:
         if not diffs or any(d[0] != "const" for d in diffs):
             return None
         parents = {}
-        for p in ast.walk(old_tree):
+        for p in walk(old_tree):
             for c in ast.iter_child_nodes(p):
                 parents[id(c)] = p
         factories = set(ix["closure_factories"])
@@ -671,7 +772,11 @@ class Selector:
         if all(attr == "arg_types" and in_value for _, attr, in_value in edits) and rel.startswith("sqlglot/expressions/"):
             out: set[int] = set()
             for cls, _, _ in edits:
-                out |= self.class_tests(cls)
+                # Required flags are read only through required_args -> error_messages(), which
+                # only Parser.validate_expression and exp.func() call: the instances that matter
+                # are the ones parser code (and the builders) construct.
+                built = self.class_tests(cls, VALIDATING)
+                out |= built if built is not None else self.class_tests(cls)
                 by_name = self.sql_name_tests(cls, set())
                 if by_name is None:
                     return None
@@ -726,6 +831,87 @@ class Selector:
             out |= hit
         return out, "value-readers"
 
+    def ran_at_import(self, rel: str, old_tree, ln: int) -> bool:
+        """Did the statement holding `line` (inside a function body) run outside any test, at
+        import or collection time? (map "imp": lines whose coverage has the empty context)"""
+        imp = self.files.get(rel, {}).get("imp")
+        if not imp:
+            return False
+        memo = self.__dict__.setdefault("_imp_memo", {})
+        if rel not in memo:
+            memo[rel] = frozenset(imp)
+        span = statement_span(old_tree, ln) or (ln, ln)
+        return any(x in memo[rel] for x in range(span[0], span[1] + 1))
+
+    def default_edit(self, old_tree, new_tree, rel: str) -> set[int] | None:
+        """The edit only flips constant defaults of parameters: the tests covering call sites that
+        rely on them (no keyword for it, too few positionals, or *args/**kwargs that might not pass
+        it), and those passing the function on as a callback (it's then called with what the
+        receiver chooses). None (fall back to the whole function) when the function is dispatched
+        by name (`*_sql`, getattr strings), referenced at import time (tables, RULES), or called
+        from import-time code. In a dialect file, limited to that dialect's users."""
+        ix = self.index
+        if "call_sites" not in ix:
+            return None
+        diffs = leaf_diffs(old_tree, new_tree)
+        if not diffs or any(d[0] != "const" for d in diffs):
+            return None
+        params: list[tuple[str, str, int | None]] = []  # (function, parameter, positional index)
+        for d in diffs:
+            found = None
+            for fn in walk(old_tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                a = fn.args
+                pos = a.posonlyargs + a.args
+                for i, dv in enumerate(a.defaults):
+                    if dv is d[1]:
+                        k = len(pos) - len(a.defaults) + i
+                        bound = 1 if pos and pos[0].arg in ("self", "cls") else 0
+                        found = (fn.name, pos[k].arg, k - bound)
+                for arg, dv in zip(a.kwonlyargs, a.kw_defaults):
+                    if dv is d[1]:
+                        found = (fn.name, arg.arg, None)
+            if found is None:
+                return None
+            params.append(found)
+        dyn = set(ix.get("dyn_names", ()))
+        out: set[int] = set()
+        for name, param, k in params:
+            if name.endswith("_sql") or name in dyn or name.startswith("__"):
+                return None
+
+            def relies(npos: int, kws: str, star: int) -> bool:
+                if star or (k is None and False):
+                    return True
+                if param in kws.split(","):
+                    return False
+                return k is None or npos <= k
+
+            for f2, s0, e0, npos, kws, star, in_fn in ix["call_sites"].get(name, ()):
+                if not relies(npos, kws, star):
+                    continue
+                if not in_fn or self.in_import_fn(f2, s0):
+                    return None  # called at import: coverage credits whichever test came first
+                hit = self.cov(f2, range(s0, e0 + 1))
+                if not hit and f2 not in self.files:
+                    return None  # unmeasured caller
+                out |= hit
+            for f2, s0, e0, where in ix.get("value_refs", {}).get(name, ()):
+                if where != "fn" or self.in_import_fn(f2, s0):
+                    return None
+                out |= self.cov(f2, range(s0, e0 + 1))
+            keys = [c[0] for c in ix.get("call_site_tests", {}).get(name, ()) if relies(c[1], c[2], c[3])]
+            keys += ix.get("value_ref_tests", {}).get(name, [])
+            for key in keys:
+                if key.endswith("::"):
+                    out |= {n for t, n in self.by_id.items() if t.startswith(key)}
+                elif key in self.by_id:
+                    out.add(self.by_id[key])
+        if rel.startswith(DIALECT_DIRS) and Path(rel).stem not in ("__init__", "base"):
+            out &= self.dialect_users(rel)
+        return out
+
     def dead_edit(self, f: dict, old_tree, new_tree, rel: str, ln: int, fn: tuple[int, int]) -> bool:
         """The changed statement never ran in any test or at import, inside a function that did run,
         and the edit changes no name's scope: no test can observe it (P3). Only for files whose
@@ -737,7 +923,7 @@ class Selector:
         if not table or not any(str(x) in table for x in range(fn[0], fn[1] + 1)):
             return False  # unmeasured file, or a function that never ran: no proof
         stmt = None
-        for node in ast.walk(old_tree):
+        for node in walk(old_tree):
             if isinstance(node, ast.stmt) and node.lineno <= ln <= (node.end_lineno or node.lineno):
                 body = getattr(node, "body", None)
                 head_end = body[0].lineno - 1 if body and getattr(body[0], "lineno", None) else node.end_lineno
@@ -781,14 +967,15 @@ class Selector:
         except SyntaxError:
             return set(self.all), "old-syntax-error"
         if old_tree is not None and new_tree is not None:
-            same = ast.dump(old_tree) == ast.dump(new_tree)
+            self._patched[rel] = (old_tree, new_tree, new)
+            same = same_tree(old_tree, new_tree)
             how = "ast-identical"
             if not same and not rel.startswith("sqlglot/typing/"):
                 # Docstring-only edits: pytest collects no doctests here and nothing reads
                 # docstrings (typing/ excluded: test_typing compares code constants).
                 strip_docstrings(old_tree)
                 strip_docstrings(new_tree)
-                same = ast.dump(old_tree) == ast.dump(new_tree)
+                same = same_tree(old_tree, new_tree)
                 how = "docstring-only"
             if same:
                 if not bytes_inert(f):
@@ -834,11 +1021,23 @@ class Selector:
                 return hit, "sqlglot:" + why
         headers = def_headers(old_tree)
         safe = None  # import_safe(), computed on first module-level line
+        lam_only = None  # lambda_body_only(), likewise
+        leaf_ok = None  # leaf_diffs() is not None, likewise
+        default_hit = None  # default_edit(), likewise (False: not applicable)
         out: set[int] = set()
         reasons = []
         for ln in sorted(changed):
             fn, cls = self.innermost(rel, ln)
-            if fn and ln in headers:
+            if fn and ln in headers and default_hit is None:
+                default_hit = self.default_edit(old_tree, new_tree, rel) or False
+            if fn and ln in headers and default_hit:
+                # An affected test calls the function, so it also runs its body: never wider than
+                # the whole-function rule below.
+                s0, e0 = headers[ln]
+                body = self.cov(rel, range(s0, e0 + 1))
+                out |= (default_hit & body) if body else default_hit
+                reasons.append("default-callers")
+            elif fn and ln in headers:
                 # Defaults and decorators run when the def runs, so coverage credits them to whichever
                 # test imported the module first (lazily loaded optimizer/executor/dialect modules).
                 # They matter to every call: take the whole function's tests, nested closures
@@ -857,11 +1056,31 @@ class Selector:
                     return set(self.all), "import-fn-unmapped"
                 out |= hit
                 reasons.append("import-fn")
+            elif fn and self.ran_at_import(rel, old_tree, ln):
+                # This function body ran while modules were being imported (class bodies parse SQL
+                # templates: DuckDBGenerator's *_TEMPLATE = exp.maybe_parse(...) runs the tokenizer,
+                # the parser and its recoverable-error path). Coverage credits that run to whichever
+                # test imported first; an exception here fails collection of every test module that
+                # imports the dialect, and a changed value is read anywhere. Run everything.
+                return set(self.all), "sqlglot:ran-at-import"
             elif fn and ln in prunable and self.dead_edit(f, old_tree, new_tree, rel, ln, fn):
                 reasons.append("dead")
             elif fn:
                 lo, hi = max(fn[0], ln - WINDOW), min(fn[1], ln + WINDOW)
                 hit = self.cov(rel, range(lo, hi + 1))
+                if leaf_ok is None:
+                    leaf_ok = leaf_diffs(old_tree, new_tree) is not None
+                span = statement_span(old_tree, ln) if leaf_ok and ln in removed else None
+                if span and ln > self.body_start(rel, fn) and not self.lambda_range(rel, ln):
+                    # A leaf edit (same tree shape: a constant, operator or comparison changed in
+                    # place) can only be seen by a test that executed its statement. Coverage
+                    # records a multi-line statement on any of its lines, so take them all (the
+                    # head only, for an if/while/for whose condition changed); the window's
+                    # neighbouring lines add nothing. Lambdas run later from elsewhere: excluded.
+                    exact = self.cov(rel, range(span[0], span[1] + 1))
+                    if exact:
+                        hit = exact
+                        reasons.append("stmt")
                 if hit & self.slow and ln in prunable and ln > self.body_start(rel, fn):
                     # A slow test (>= 5 s) is kept only if it ran the changed line itself. Only for
                     # same-indent line replacements on a line coverage records: continuation lines,
@@ -892,7 +1111,9 @@ class Selector:
             else:
                 lam = self.lambda_range(rel, ln)
                 hit = self.cov(rel, range(lam[0], lam[1] + 1)) if lam else set()
-                if hit and ln in removed and ln != lam[0]:
+                if lam_only is None:
+                    lam_only = lambda_body_only(old_tree, new_tree)
+                if hit and ln in removed and (ln != lam[0] or lam_only):
                     # An edited line inside a lambda's body (class tables): the body runs only
                     # when called, and coverage sees that.
                     out |= hit
@@ -1002,6 +1223,9 @@ class Selector:
             # tests/helpers.py's fixture loaders drop empty lines and lines starting with "--".
             return set(), "fixture-comment"
         hits, how = self.fixture_readers(f["path"])
+        narrowed = self.setup_fixture_readers(f) if f["old"] == f["path"] else None
+        if narrowed is not None:
+            return narrowed, "fixture-setup-attr"
         if f["old"] and f["old"] != f["path"]:
             more, _ = self.fixture_readers(f["old"])  # readers of the old name break too
             hits |= more
@@ -1012,6 +1236,8 @@ class Selector:
     def select(self, files: list[dict]) -> tuple[set[int], list[str]]:
         out: set[int] = set()
         why = []
+        self._patched: dict[str, tuple] = {}  # rel -> (old tree, new tree, new source), by python_change
+        clear_tree_caches()  # trees are per commit; keep memory flat
         for f in files:
             rel = f["path"]
             suffix = Path(rel).suffix
@@ -1040,8 +1266,186 @@ class Selector:
                 s, r = set(self.all), "other"
             out |= s
             why.append(f"{rel}:{r}:{len(s)}")
+        tpcds = self.by_id.get(TPCDS_TEST)
+        if tpcds in out and self.tpc_probe_clears(files):
+            out.discard(tpcds)
+            why.append("tpc-probe-cleared")
         return out, why
 
+    def tpc_probe_clears(self, files: list[dict]) -> bool:
+        """test_execute_tpcds (21 s) can't see this commit: run tools/tpc_probe.py on the patched
+        sources and compare with the build-time fingerprints.
+
+        The test parses each TPC-DS query (parent), pickles it to a child that runs execute():
+        optimize(), then the planner and the Python executor on the data, and compares with DuckDB
+        results for transpile(sql, write="duckdb"). The probe reproduces parse_one, optimize and
+        transpile exactly. The rest runs code the edit must not touch: every changed line is
+        inside a function body (not a def header, not run at import), in a statement the test
+        never runs outside those three calls (map "tpc_out", from tools/coverage_tpc.sh), and the
+        edit only changes leaves in place (no new or removed definitions that could change what
+        the rest of the test calls). Then unchanged code gets identical input (serde.dump
+        fingerprints: everything pickling sends) and behaves identically. A probe that is much
+        slower than the baseline (a timeout risk), errors, or differs anywhere keeps the test."""
+        if not TPC_BASE.exists() or not TPC_PROBE.exists():
+            return False
+        overlay: dict[str, str] = {}
+        for f in files:
+            rel = f["path"] or ""
+            if f["binary"] or f["rename"] or f["created"] or f["deleted"] or f["old"] != rel:
+                return False
+            if rel.startswith("tests/"):
+                if rel.endswith(".py") or "/tpc-ds/" in rel:
+                    return False  # the test, its helpers, or its data
+                continue  # another fixture: read by other tests only
+            if not rel.startswith("sqlglot/") or not rel.endswith(".py"):
+                return False
+            rec = self._patched.get(rel)
+            if rec is None:
+                return False
+            old_tree, new_tree, new_src = rec
+            if same_tree(old_tree, new_tree):
+                continue
+            if rel == "sqlglot/serde.py" or leaf_diffs(old_tree, new_tree) is None:
+                return False
+            outside = self.files.get(rel, {}).get("tpc_out")
+            if outside is None:
+                return False
+            outside = set(outside)
+            headers = def_headers(old_tree)
+            pickling = [(n.lineno, n.end_lineno) for n in walk(old_tree)
+                        if isinstance(n, ast.FunctionDef) and n.name in PICKLE_FNS]
+            defs = {n.lineno: n for n in walk(old_tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            for ln in touched_old_lines(f):
+                fn, _ = self.innermost(rel, ln)
+                if fn and ln in headers:
+                    # A signature line (a constant default, by leaf_diffs): it runs at import and
+                    # can't raise there; it only changes calls of this function. Fine if the rest
+                    # of the test never runs the body. Decorator lines (they run code) are not.
+                    s0, e0 = headers[ln]
+                    node = next((d for d in defs.values() if d.lineno <= ln and (d.end_lineno or 0) >= e0
+                                 and min([d.lineno] + [x.lineno for x in d.decorator_list]) == s0), None)
+                    if node is None or ln < node.lineno or any(x in outside for x in range(s0, e0 + 1)):
+                        return False
+                    continue
+                if not fn or self.ran_at_import(rel, old_tree, ln):
+                    return False
+                if any(a <= ln <= b for a, b in pickling):
+                    return False
+                span = statement_span(old_tree, ln) or (ln, ln)
+                if any(x in outside for x in range(span[0], span[1] + 1)):
+                    return False
+            overlay[rel] = new_src
+        if not overlay:
+            return False
+        try:
+            base = json.loads(TPC_BASE.read_text())
+            tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"tpc_overlay_{os.getpid()}.json"
+            tmp.write_text(json.dumps(overlay))
+            limit = 2 * base["t"] + 5 + 2 * EXEC_BUDGET_S
+            r = subprocess.run([sys.executable, str(TPC_PROBE), str(SRC), str(tmp), str(TPC_BASE)],
+                               capture_output=True, text=True, timeout=limit + 30,
+                               env=dict(os.environ, PYTHONHASHSEED="0"))
+            tmp.unlink(missing_ok=True)
+            got = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception as e:  # noqa: BLE001 - no proof: keep the test
+            log(f"tpc probe failed: {type(e).__name__}: {e}")
+            return False
+        if not base["h"] or len(got["h"]) != len(base["h"]) or got["t"] > limit:
+            return False
+        settled = got.get("x", {})
+        for i, (a, b) in enumerate(zip(got["h"], base["h"])):
+            # A query whose inputs differ passes only if executing it gave the pinned code's result.
+            if a != b and (str(i) not in settled or settled[str(i)] != base.get("x", {}).get(str(i))):
+                return False
+        return True
+
+
+
+# -- fast tree helpers. ast.walk/ast.dump are pure Python and were most of the runtime CPU.
+
+_AST = ast.AST
+_WALK_MEMO: dict[int, tuple] = {}   # id(tree) -> (tree, [nodes in ast.walk order])
+_LEAF_MEMO: dict[tuple, tuple] = {}  # (id(a), id(b)) -> (a, b, leaf_diffs(a, b))
+
+
+def _iter_walk(node):
+    """ast.walk, same breadth-first order, without the iter_fields/iter_child_nodes generators."""
+    todo = [node]
+    i = 0
+    while i < len(todo):
+        n = todo[i]
+        i += 1
+        for f in n._fields:
+            v = getattr(n, f, None)
+            if isinstance(v, _AST):
+                todo.append(v)
+            elif v.__class__ is list:
+                todo.extend([x for x in v if isinstance(x, _AST)])
+        yield n
+
+
+def nodes(tree) -> list:
+    """Every node of tree in ast.walk order, computed once per tree object."""
+    hit = _WALK_MEMO.get(id(tree))
+    if hit is None or hit[0] is not tree:
+        hit = _WALK_MEMO[id(tree)] = (tree, list(_iter_walk(tree)))
+    return hit[1]
+
+
+def walk(tree):
+    """Drop-in for ast.walk: cached for whole modules (walked many times per commit)."""
+    return nodes(tree) if isinstance(tree, ast.Module) else _iter_walk(tree)
+
+
+def _forget(tree) -> None:
+    """A tree is about to change in place: drop everything cached about it."""
+    _WALK_MEMO.pop(id(tree), None)
+    _LEAF_MEMO.clear()
+
+
+def clear_tree_caches() -> None:
+    _WALK_MEMO.clear()
+    _LEAF_MEMO.clear()
+
+
+_BLOCK = (ast.stmt, ast.excepthandler, ast.match_case)
+
+
+def _statements(tree) -> list:
+    """tree plus every statement, handler and match case in it: the only places a def or class
+    (and so a docstring) can sit, without visiting any expression node."""
+    out = [tree]
+    i = 0
+    while i < len(out):
+        n = out[i]
+        i += 1
+        for f in n._fields:
+            v = getattr(n, f, None)
+            if v.__class__ is list and v and isinstance(v[0], _BLOCK):
+                out.extend(v)
+    return out
+
+
+def same_tree(a, b) -> bool:
+    """ast.dump(a) == ast.dump(b), without building the strings, stopping at the first difference."""
+    stack = [(a, b)]
+    pop, push = stack.pop, stack.append
+    while stack:
+        x, y = pop()
+        if x.__class__ is not y.__class__:
+            return False
+        if isinstance(x, _AST):
+            for f in x._fields:
+                push((getattr(x, f, None), getattr(y, f, None)))
+        elif x.__class__ is list:
+            if len(x) != len(y):
+                return False
+            stack.extend(zip(x, y))
+        elif x != y:
+            # Same class, so this matches dump's repr comparison (parsed constants are never nan
+            # or -0.0; if they were, this errs towards "different", which selects more).
+            return False
+    return True
 
 SAFE_BUILTIN_BASES = {"object", "Generic", "ABC", "Protocol", "Exception", "ValueError", "TypeError",
                       "KeyError", "RuntimeError"}
@@ -1049,10 +1453,19 @@ SWAP_OPS = (ast.cmpop, ast.operator, ast.unaryop, ast.boolop)
 
 
 def leaf_diffs(a, b) -> list[tuple] | None:
+    """Memoised per tree pair (callers only read the result; strip_docstrings clears it)."""
+    key = (id(a), id(b))
+    hit = _LEAF_MEMO.get(key)
+    if hit is None or hit[0] is not a or hit[1] is not b:
+        hit = _LEAF_MEMO[key] = (a, b, _leaf_diffs(a, b))
+    return hit[2]
+
+
+def _leaf_diffs(a, b) -> list[tuple] | None:
     """Where two same-shaped trees differ: ("const", old, new) for Constant values, ("cmp", old_compare,
     new_compare, i) for the i-th comparison operator, ("op", old, new) for other operators.
     None when they differ in any other way (shape, names, attributes...)."""
-    wa, wb = list(ast.walk(a)), list(ast.walk(b))
+    wa, wb = nodes(a), nodes(b)
     if len(wa) != len(wb):
         return None
     out: list[tuple] = []
@@ -1108,6 +1521,43 @@ def scope_signature(src: str, rel: str) -> list:
     return out
 
 
+def statement_span(tree, line: int) -> tuple[int, int] | None:
+    """Lines of the innermost statement whose own text holds `line`: a simple statement's whole
+    range, or a compound statement's header (up to its first body statement). None for def/class
+    headers and anything else."""
+    best = None
+    for node in walk(tree):
+        if not isinstance(node, ast.stmt) or not (node.lineno <= line <= (node.end_lineno or node.lineno)):
+            continue
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and getattr(body[0], "lineno", None):
+            head = (node.lineno, body[0].lineno - 1)
+        elif isinstance(body, list):
+            continue
+        else:
+            head = (node.lineno, node.end_lineno or node.lineno)
+        if head[0] <= line <= head[1] and (best is None or head[0] >= best[1][0]):
+            best = (node, head)
+    if best is None or isinstance(best[0], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return None
+    return best[1]
+
+
+def lambda_body_only(old_tree, new_tree) -> bool:
+    """Every difference between the trees is a leaf (constant, operator, comparison) inside the
+    body of a lambda: the table entry and its key are untouched, only what the call computes."""
+    diffs = leaf_diffs(old_tree, new_tree)
+    # Operator diffs carry shared singleton nodes (ast.And()), whose identity says nothing about
+    # where they sit: only constants and comparisons (unique nodes) are placed.
+    if not diffs or any(d[0] == "op" for d in diffs):
+        return False
+    inside: set[int] = set()
+    for node in walk(old_tree):
+        if isinstance(node, ast.Lambda):
+            inside |= {id(n) for n in walk(node.body)}
+    return all(id(d[1]) in inside for d in diffs)
+
+
 def call_name(c: ast.Call) -> str | None:
     fn = c.func
     return fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
@@ -1118,7 +1568,7 @@ def def_headers(tree) -> dict[int, tuple[int, int]]:
     out: dict[int, tuple[int, int]] = {}
     if tree is None:
         return out
-    for n in ast.walk(tree):  # outer first, so nested defs overwrite
+    for n in walk(tree):  # outer first, so nested defs overwrite
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             start = min([n.lineno] + [d.lineno for d in n.decorator_list])
             # strip_docstrings may leave a bare Pass with no position as the only statement.
@@ -1133,7 +1583,7 @@ def class_bound(tree) -> set[tuple[str, str]]:
     out: set[tuple[str, str]] = set()
     if tree is None:
         return out
-    for c in ast.walk(tree):
+    for c in walk(tree):
         if isinstance(c, ast.ClassDef):
             for s in c.body:
                 if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -1159,7 +1609,7 @@ def class_sql_names(tree) -> dict[str, set[str]]:
         for st in cls.body:
             targets = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, ast.AnnAssign) else []
             if any(getattr(t, "id", None) == "_sql_names" for t in targets) and st.value is not None:
-                names |= {e.value.lower() for e in ast.walk(st.value)
+                names |= {e.value.lower() for e in walk(st.value)
                           if isinstance(e, ast.Constant) and isinstance(e.value, str)}
         out[cls.name] = names
     return out
@@ -1203,7 +1653,7 @@ def module_bound(tree) -> set[str]:
             targets = stmt.targets if isinstance(stmt, ast.Assign) else \
                 [stmt.target] if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)) else []
             for t in targets:
-                for n in ast.walk(t):
+                for n in walk(t):
                     if isinstance(n, ast.Name):
                         out.add(n.id)
     return out
@@ -1253,7 +1703,8 @@ def bytes_inert(f: dict) -> bool:
 
 def strip_docstrings(tree) -> None:
     """Drop module, class and function docstrings in place (a Pass keeps bodies non-empty)."""
-    for node in ast.walk(tree):
+    _forget(tree)
+    for node in _statements(tree):
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             body = node.body
             if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
@@ -1282,7 +1733,7 @@ def changed_statement_lines(old_tree, new_tree, touched: set[int]) -> set[int]:
     out = set(touched)
     if old_tree is None:
         return out
-    for node in ast.walk(old_tree):
+    for node in walk(old_tree):
         # Only simple statements: a compound one's header (def, class, if, for...) is not
         # where its body's lines are recorded.
         if not isinstance(node, ast.stmt) or hasattr(node, "body") or not node.end_lineno:
@@ -1293,7 +1744,7 @@ def changed_statement_lines(old_tree, new_tree, touched: set[int]) -> set[int]:
         if not inside:
             continue
         # Edits inside a lambda (class tables) are recorded on the lambda's own lines.
-        lambdas = [(n.lineno, n.end_lineno) for n in ast.walk(node) if isinstance(n, ast.Lambda)]
+        lambdas = [(n.lineno, n.end_lineno) for n in walk(node) if isinstance(n, ast.Lambda)]
         if lambdas and all(any(a <= ln <= b for a, b in lambdas) for ln in inside):
             continue
         out.add(node.lineno)
@@ -1415,4 +1866,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--bake"]:
+        bake()
+    else:
+        main()

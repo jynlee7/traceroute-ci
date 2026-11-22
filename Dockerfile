@@ -5,13 +5,22 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 # selector reads the original sources to apply each patch and compare syntax trees.
 # No tests run at build time.
 ARG PIN=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
-COPY tools/fetch_src.py tools/build_index.py /app/tools/
+COPY tools/fetch_src.py tools/build_index.py tools/tpc_probe.py /app/tools/
 RUN python /app/tools/fetch_src.py "$PIN" /app/src
 
 COPY selector.py /app/selector.py
 COPY maps /app/maps
 # Static index of import-time code (class tables, dialect families); build CPU is not charged.
+# Then a marshal snapshot of map + index for the runtime (same interpreter; JSON is the fallback).
 RUN (python /app/tools/build_index.py /app/src /app/maps/index.json || echo "index build failed; selector falls back") \
+ && (python -S /app/selector.py --bake || echo "bake failed; selector reads JSON") \
+ && chmod -R a+rX /app
+
+# Fingerprints of what test_execute_tpcds computes with the pinned sources (parsed and optimized
+# TPC-DS queries, their DuckDB SQL, every query's result): the selector's TPC probe compares a
+# commit's patched sources against them. Written only on success; without it the probe is off.
+RUN (PYTHONHASHSEED=0 python /app/tools/tpc_probe.py /app/src --baseline > /tmp/tpc_base.json \
+     && mv /tmp/tpc_base.json /app/maps/tpc_base.json || echo "tpc baseline failed; probe off") \
  && chmod -R a+rX /app
 
 ENV PYTHONDONTWRITEBYTECODE=1

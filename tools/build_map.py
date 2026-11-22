@@ -101,12 +101,20 @@ def main() -> None:
     for measured in sorted(data.measured_files()):
         # Paths are recorded where coverage ran (e.g. /w/work/sqlglot/... in the container).
         marker = "/work/sqlglot/"
-        rel = measured.split(marker, 1)[1] if marker in measured else os.path.relpath(measured, ROOT.resolve())
+        if marker in measured:
+            rel = measured.split(marker, 1)[1]
+        elif measured.startswith("/tmp/s/"):  # tools/coverage_tpc.sh runs on a copy in /tmp/s
+            rel = measured[len("/tmp/s/"):]
+        else:
+            rel = os.path.relpath(measured, ROOT.resolve())
         if not rel.startswith("sqlglot/"):
             continue
         lines = {}
+        imported = []  # lines that ran outside any test: at import / collection time
         for lineno, contexts in data.contexts_by_lineno(measured).items():
             tests = set()
+            if "" in contexts:
+                imported.append(lineno)
             for ctx in contexts:
                 if not ctx:
                     continue
@@ -120,7 +128,7 @@ def main() -> None:
                 else:
                     unmatched.add(tid)
             lines[str(lineno)] = intern(tests)
-        files[rel] = {"lines": lines}
+        files[rel] = {"lines": lines, "imp": sorted(imported)}
 
     for path in sorted((ROOT / "sqlglot").rglob("*.py")):
         rel = str(path.relative_to(ROOT))
@@ -155,7 +163,43 @@ def main() -> None:
     # Only TPC-DS executes in the pool: tpc-h.sql has no "# execute: true" entries, so
     # test_execute_tpch's children return None and its own (parent-side) coverage is exact.
     tpc_exec = {index[t] for t in ("tests/test_executor.py::TestExecutor::test_execute_tpcds",) if t in index}
+    # Exact coverage of the TPC executor tests (tools/coverage_tpc.sh: the same tests with the
+    # spawn pool swapped for one thread, so coverage sees the children's work). When present it
+    # replaces the proxy below: the proxy both missed lines the children run (simplify, builders,
+    # jsonpath...) and claimed whole files they never touch.
+    exact_path = ROOT / ".coverage.tpc"
+    if exact_path.exists() and tpc_exec:
+        tpc = CoverageData(basename=str(exact_path))
+        tpc.read()
+        added = 0
+        for measured in tpc.measured_files():
+            rel = measured[len("/tmp/s/"):] if measured.startswith("/tmp/s/") else \
+                measured.split("/work/sqlglot/", 1)[-1]
+            if not rel.startswith("sqlglot/"):
+                continue
+            entry = files.setdefault(rel, {"lines": {}})
+            lines = entry["lines"]
+            # Only these two tests ran in that process, so modules imported lazily during them
+            # (dialects) credit their import-time lines (class bodies, def lines) to tpcds. Lines
+            # the main run executed at import are left to the import-time rules.
+            imported = set(entry.get("imp", ()))
+            outside = []  # lines tpcds runs outside parse_one/transpile/optimize (the probe can't see)
+            for ln, contexts in tpc.contexts_by_lineno(measured).items():
+                own = any(c.startswith("tests/test_executor.py::TestExecutor::test_execute_tpcds") for c in contexts)
+                if own:
+                    outside.append(ln)
+                if ln in imported:
+                    continue
+                if own or "tpc-probed" in contexts:
+                    old = set(set_table[lines[str(ln)]]) if str(ln) in lines else set()
+                    lines[str(ln)] = intern(old | tpc_exec)
+                    added += 1
+            entry["tpc_out"] = sorted(outside)
+        print(f"exact TPC coverage: {added} lines", file=sys.stderr)
+        proxy_ids = set()  # no proxy
     for rel, entry in files.items():
+        if not proxy_ids:
+            break
         lines = entry["lines"]
         # The children run the planner, the Python executor and the Python generator it uses.
         whole = rel.startswith("sqlglot/executor/") or rel in ("sqlglot/planner.py", "sqlglot/generators/python.py")

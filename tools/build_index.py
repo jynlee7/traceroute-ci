@@ -293,7 +293,9 @@ def build(root: Path) -> dict:
                 deco_names = {x.attr if isinstance(x, ast.Attribute) else getattr(x, "id", "") for x in deco}
                 once = bool(deco_names & {"cache", "lru_cache", "cached_property", "cache_info"})
                 for n in ast.walk(d):
-                    if isinstance(n, (ast.Global, ast.Nonlocal)):
+                    if isinstance(n, ast.Global):
+                        # Module state: written once, read by everything later. (nonlocal only
+                        # rebinds an enclosing function's local and says nothing about run-once.)
                         once = True
                     elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
                         targets = n.targets if isinstance(n, ast.Assign) else [n.target]
@@ -489,7 +491,7 @@ def build(root: Path) -> dict:
                     qualified_attrs.setdefault(f"{owner}.{n.attr}", set()).add(rel)
 
     extra: dict = {"qualified_attrs": {k: sorted(v) for k, v in qualified_attrs.items()}}
-    for part in (eq_tables, construct_tables, attr_read_tables):
+    for part in (eq_tables, construct_tables, attr_read_tables, setup_fixture_tables, call_site_tables):
         try:
             extra.update(part(root, trees, all_dialect_tests))
         except Exception as e:  # optional tables: the selector refuses the rules that need them
@@ -939,6 +941,172 @@ def attr_read_tables(root: Path, trees: dict, _all_dialect_tests) -> dict:
                 idents.setdefault(ident, set()).update(t for t, _ in units)
     return {"attr_reads": reads, "hop_reads": hop_reads, "test_attr_users": {k: sorted(v) for k, v in users.items()},
             "test_idents": {k: sorted(v) for k, v in idents.items()}}
+
+
+def setup_fixture_tables(root: Path, _trees: dict, _all_dialect_tests) -> dict:
+    """setup_fixtures: fixture string -> test ids, for fixtures a test class loads in setUpClass
+    into a class attribute (cls.tpch_sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))).
+
+    Their per-test strings come from the class helper, so every test of the class seems to read
+    them; the real readers are the tests that use that attribute: directly (self.X / cls.X) or
+    through a method of the class that does. Only strings whose every occurrence in the class is
+    such an assignment are listed."""
+    out: dict[str, set] = {}
+    for rel, tree in _parse_tests(root).items():
+        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+            methods = {m.name: m for m in cls.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            setup = methods.get("setUpClass")
+            if setup is None:
+                continue
+            loads: dict[str, str] = {}  # fixture string -> attribute
+            bad: set[str] = set()
+            for st in ast.walk(setup):
+                if isinstance(st, ast.Assign):
+                    strs = {c.value for c in ast.walk(st.value) if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+                    tg = st.targets[0] if len(st.targets) == 1 else None
+                    ok = isinstance(tg, ast.Attribute) and isinstance(tg.value, ast.Name) and tg.value.id == "cls"
+                    for x in strs:
+                        if ok and x not in loads:
+                            loads[x] = tg.attr
+                        else:
+                            bad.add(x)
+            # The string must appear nowhere else in the class.
+            for name, m in methods.items():
+                if name == "setUpClass":
+                    continue
+                for c in ast.walk(m):
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str) and c.value in loads:
+                        bad.add(c.value)
+
+            def uses(m) -> set[str]:
+                return {a.attr for a in ast.walk(m) if isinstance(a, ast.Attribute)
+                        and isinstance(a.value, ast.Name) and a.value.id in ("self", "cls")}
+
+            direct = {name: uses(m) for name, m in methods.items()}
+            for x, attr in loads.items():
+                if x in bad or not x.endswith(".sql"):
+                    continue
+                users = {n for n, u in direct.items() if attr in u and n != "setUpClass"}
+                # Close over methods calling those methods (self.helper(...)).
+                changed = True
+                while changed:
+                    changed = False
+                    for n, u in direct.items():
+                        if n not in users and n != "setUpClass" and u & users:
+                            users.add(n)
+                            changed = True
+                loaded = set(loads.values())
+                for n in users:
+                    # A test passing one loaded attribute to a shared helper (self._mp_execute(...,
+                    # self.tpcds_sqls, False)) reads that fixture, not the others the helper can
+                    # also reach through a flag.
+                    named = direct[n] & loaded
+                    if named and attr not in named:
+                        continue
+                    if n.startswith("test"):
+                        out.setdefault(x, set()).add(f"{rel}::{cls.name}::{n}")
+    return {"setup_fixtures": {k: sorted(v) for k, v in out.items()}}
+
+
+def call_site_tables(root: Path, trees: dict, _all_dialect_tests) -> dict:
+    """For functions with a constant default argument: every call site by callee name, so that a
+    flipped default can be limited to calls that rely on it (selector: default_edit).
+
+    call_sites: name -> [file, start, end, positional count, "kw,kw", star, in_fn] in sqlglot: the
+                enclosing statement's lines (the call's own inside a lambda); star is 1 when the call
+                has *args or **kwargs; in_fn is 1 inside a def or lambda (runs when called).
+    call_site_tests: name -> [test id or "file::Class::" / "file::" prefix, npos, "kw,kw", star]
+                for calls in test code (a helper's call counts for its whole class or module).
+    value_refs: name -> [file, start, end, "fn" | "top"]: the name used as a value (a callback
+                passed on, a table entry, an alias); value_ref_tests likewise in test code.
+    dyn_names: names passed as strings to getattr-like calls: callers can't be listed."""
+    wanted: set[str] = set()
+    for tree in trees.values():
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any(isinstance(d, ast.Constant) for d in n.args.defaults + [k for k in n.args.kw_defaults if k]):
+                    wanted.add(n.name)
+    sites: dict[str, list] = {}
+    tsites: dict[str, list] = {}
+    vrefs: dict[str, list] = {}   # name -> [file, start, end, "fn" | "top"] in sqlglot
+    tvrefs: dict[str, list] = {}  # name -> test owner keys
+    dyn: set[str] = set()         # names passed as strings to getattr-like calls
+    DYN_CALLS = {"getattr", "hasattr", "setattr", "attrgetter", "methodcaller", "delattr"}
+
+    def scan(tree, emit, emit_value) -> None:
+        funcs = set()
+        parents: dict[int, ast.AST] = {}
+        for n in ast.walk(tree):
+            for c in ast.iter_child_nodes(n):
+                parents[id(c)] = n
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call):
+                f = n.func
+                funcs.add(id(f))
+                name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+                if name in DYN_CALLS:
+                    for a in n.args:
+                        if isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value in wanted:
+                            dyn.add(a.value)
+                if name in wanted:
+                    star = int(any(isinstance(a, ast.Starred) for a in n.args) or any(k.arg is None for k in n.keywords))
+                    npos = sum(1 for a in n.args if not isinstance(a, ast.Starred))
+                    # Cls.method(self, ...): the receiver is a class, so one positional is self.
+                    if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id[:1].isupper():
+                        npos = max(npos - 1, 0)
+                    kws = ",".join(sorted(k.arg for k in n.keywords if k.arg))
+                    emit(name, n, npos, kws, star, parents)
+        for n in ast.walk(tree):
+            if id(n) in funcs:
+                continue
+            nm = n.id if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) else \
+                n.attr if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) else None
+            if nm in wanted:
+                emit_value(nm, n, parents)
+
+    def stmt_of(n, parents):
+        """Enclosing statement, and whether it sits inside a def or lambda (runs when called)."""
+        cur, st, in_fn = n, None, False
+        while cur is not None:
+            if st is None and isinstance(cur, ast.Lambda):
+                st = n  # a lambda body: coverage records the call's own lines when it runs
+            if st is None and isinstance(cur, ast.stmt):
+                st = cur
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and cur is not n:
+                in_fn = True
+                break
+            cur = parents.get(id(cur))
+        return st or n, in_fn
+
+    for rel, tree in trees.items():
+        def emit(name, n, npos, kws, star, parents, rel=rel):
+            st, in_fn = stmt_of(n, parents)
+            sites.setdefault(name, []).append([rel, st.lineno, st.end_lineno or st.lineno, npos, kws, star, int(in_fn)])
+
+        def emit_value(name, n, parents, rel=rel):
+            st, in_fn = stmt_of(n, parents)
+            vrefs.setdefault(name, []).append([rel, st.lineno, st.end_lineno or st.lineno, "fn" if in_fn else "top"])
+        scan(tree, emit, emit_value)
+
+    for rel, tree in _parse_tests(root).items():
+        owner: dict[int, str] = {}
+        for top in tree.body:
+            if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                key = f"{rel}::{top.name}" if top.name.startswith("test") else f"{rel}::"
+                for x in ast.walk(top):
+                    owner[id(x)] = key
+            elif isinstance(top, ast.ClassDef):
+                for item in top.body:
+                    is_test = isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
+                    key = f"{rel}::{top.name}::{item.name}" if is_test else f"{rel}::{top.name}::"
+                    for x in ast.walk(item):
+                        owner[id(x)] = key
+        scan(tree,
+             lambda name, n, npos, kws, star, parents, owner=owner, rel=rel: tsites.setdefault(name, []).append(
+                 [owner.get(id(n), f"{rel}::"), npos, kws, star]),
+             lambda name, n, parents, owner=owner, rel=rel: tvrefs.setdefault(name, []).append(owner.get(id(n), f"{rel}::")))
+    return {"call_sites": sites, "call_site_tests": tsites, "value_refs": vrefs, "value_ref_tests": tvrefs,
+            "dyn_names": sorted(dyn)}
 
 
 def main() -> None:
