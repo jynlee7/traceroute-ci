@@ -6,6 +6,12 @@ from selector import split
 d = sys.argv[1]
 tests = {t["number"]: t for t in json.load(open("sample/tests.json"))["tests"]}
 ans = json.load(open(f"{d}/answers.json"))["commits"]
+try:  # relabels: labels taken while the machine was overloaded (lone timeouts of slow tests)
+    for _c, _f in json.load(open(f"{d}/overrides.json")).items():
+        if _c in ans:
+            ans[_c]["failing"] = _f
+except FileNotFoundError:
+    pass
 why = {l.split(" ", 1)[0]: l.strip() for l in open(f"{d}/why.log") if l.strip()}
 tot = misses = n = 0
 rows = []

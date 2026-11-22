@@ -28,6 +28,13 @@ TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPC_PROBE = Path(os.environ.get("TPC_PROBE", APP / "tools/tpc_probe.py"))
 TPC_BASE = Path(os.environ.get("TPC_BASE", APP / "maps/tpc_base.json"))  # tpc_probe.py on the pinned sources
 EXEC_BUDGET_S = 4.0  # tools/tpc_probe.py EXEC_BUDGET: query executions it may add
+STMT_MAP = Path(os.environ.get("STMT_MAP", APP / "maps/stmt.map"))  # tools/build_stmt_map.py
+STMT_PROBE = Path(os.environ.get("STMT_PROBE", APP / "tools/stmt_probe.py"))
+PROBE_START_S = float(os.environ.get("PROBE_START_S", "0.15"))  # CPU per forked probe (fork, hot patch)
+PROBE_SAFETY = float(os.environ.get("PROBE_SAFETY", "4.0"))  # estimated case time -> charged CPU
+PROBE_PER_TEST_S = 0.04  # reduced-class build, setUpClass
+PROBE_RATIO = float(os.environ.get("PROBE_RATIO", "1.5"))  # gain needed per CPU second (half the probed commits break something)
+NO_STMT_PROBE = ("tests/test_executor.py",)  # heavy setUpClass (table loads)
 PICKLE_FNS = ("__reduce__", "__reduce_ex__", "__getstate__", "__setstate__")
 TYPING_TEST = "tests/test_typing.py"  # reads every sqlglot/typing/*.py file directly
 
@@ -714,7 +721,7 @@ class Selector:
             memo[key] = frozenset(out)
         return set(memo[key])
 
-    def value_edit(self, old_tree, new_tree, rel: str) -> tuple[set[int], str] | None:
+    def value_edit(self, old_tree, new_tree, rel: str, sink: dict | None = None) -> tuple[set[int], str] | None:
         """The edit only changes literal values held by class attributes: the tests that read them.
 
         P1, a class constant (UPPER_CASE): coverage of every runtime line reading that attribute
@@ -825,6 +832,11 @@ class Selector:
             hit: set[int] = set()
             for f2, lns in lines.items():
                 hit |= self.cov(f2, lns)
+                if sink is not None:
+                    sink.setdefault("lines", {}).setdefault(f2, set()).update(lns)
+            if sink is not None:
+                sink.setdefault("keep", set()).update(
+                    self.by_id[t] for t in ix.get("test_attr_users", {}).get(attr, ()) if t in self.by_id)
             if rel.startswith(DIALECT_DIRS):
                 hit &= self.dialect_users(rel)
             hit |= {self.by_id[t] for t in ix.get("test_attr_users", {}).get(attr, ()) if t in self.by_id}
@@ -1266,6 +1278,14 @@ class Selector:
                 s, r = set(self.all), "other"
             out |= s
             why.append(f"{rel}:{r}:{len(s)}")
+        if out and os.environ.get("STMT_OFF") != "1":
+            try:
+                gone, how = self.stmt_probe(out, files)
+            except Exception as e:  # noqa: BLE001 - no proof: keep everything
+                gone, how = set(), f"stmt-error:{type(e).__name__}:{e}"
+            if gone or how:
+                out -= gone
+                why.append(f"stmt[{how}]-{len(gone)}")
         tpcds = self.by_id.get(TPCDS_TEST)
         if tpcds in out and self.tpc_probe_clears(files):
             out.discard(tpcds)
@@ -1337,14 +1357,20 @@ class Selector:
             overlay[rel] = new_src
         if not overlay:
             return False
+        if probe_allowance() < 2 * json.loads(TPC_BASE.read_text()).get("t", 10) + 15:
+            log("tpc probe skipped: batch time")
+            return False
         try:
             base = json.loads(TPC_BASE.read_text())
             tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"tpc_overlay_{os.getpid()}.json"
             tmp.write_text(json.dumps(overlay))
             limit = 2 * base["t"] + 5 + 2 * EXEC_BUDGET_S
+            _t0 = os.times()
             r = subprocess.run([sys.executable, str(TPC_PROBE), str(SRC), str(tmp), str(TPC_BASE)],
                                capture_output=True, text=True, timeout=limit + 30,
                                env=dict(os.environ, PYTHONHASHSEED="0"))
+            _t1 = os.times()
+            log(f"tpc probe cpu {(_t1.children_user + _t1.children_system - _t0.children_user - _t0.children_system):.2f}s")
             tmp.unlink(missing_ok=True)
             got = json.loads(r.stdout.strip().splitlines()[-1])
         except Exception as e:  # noqa: BLE001 - no proof: keep the test
@@ -1359,6 +1385,256 @@ class Selector:
                 return False
         return True
 
+
+    # -- statement probe
+
+    def local_lines(self, files: list[dict]) -> tuple[dict[str, set[int]], dict[str, str], set[int]] | str:
+        """Old lines whose statements behave differently after the commit, when every change is a
+        leaf edit in place (constant, operator, comparison) inside a function or lambda body that
+        never ran at import. Then code outside those statements runs exactly as before, on the
+        same inputs, as long as no edited statement ran. None when that can't be shown."""
+        lines: dict[str, set[int]] = {}
+        overlay: dict[str, str] = {}
+        keep: set[int] = set()
+        for f in files:
+            rel = f["path"] or ""
+            if f["binary"] or f["rename"] or f["created"] or f["deleted"] or f["old"] != rel:
+                return "filekind"
+            if not rel.startswith("sqlglot/") or not rel.endswith(".py"):
+                return "nonsrc"
+            rec = self._patched.get(rel)
+            if rec is None:
+                return "norec"
+            old_tree, new_tree, new_src = rec
+            if same_tree(old_tree, new_tree):
+                continue
+            if leaf_diffs(old_tree, new_tree) is None:
+                return "structural"
+            headers = def_headers(old_tree)
+            out = lines.setdefault(rel, set())
+            touched = touched_old_lines(f)
+            if not any(self.innermost(rel, ln)[0] or self.lambda_range(rel, ln) for ln in touched):
+                # Class constants: behaviour changes only where they are read at runtime.
+                sink: dict = {}
+                if self.value_edit(old_tree, new_tree, rel, sink) is None or not sink.get("lines"):
+                    return "classbody"
+                for f2, lns in sink["lines"].items():
+                    t2 = self._tree(f2)
+                    if t2 is None:
+                        return "classbody-src"
+                    dst = lines.setdefault(f2, set())
+                    for ln in lns:
+                        span = statement_span(t2, ln) or (ln, ln)
+                        dst.update(range(span[0], span[1] + 1))
+                keep |= sink.get("keep", set())
+                overlay[rel] = new_src
+                continue
+            diffs = leaf_diffs(old_tree, new_tree)
+            dflt: dict[int, tuple[int, int]] = {}  # id(node under a default) -> function range
+            for n in walk(old_tree):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    for d in list(n.args.defaults) + [x for x in n.args.kw_defaults if x is not None]:
+                        for m in walk(d):
+                            dflt[id(m)] = (n.lineno, n.end_lineno or n.lineno)
+            for ln in touched:
+                fn, _ = self.innermost(rel, ln)
+                lam = self.lambda_range(rel, ln)
+                if fn and ln in headers and not (lam and lam[0] >= fn[0]):
+                    # A constant default: it changes only calls of this function, whose body
+                    # (or, for a nested def, its def statement) then runs.
+                    on_line = [d for d in diffs if getattr(d[1], "lineno", None) == ln]
+                    if any(d[0] == "op" for d in diffs) or not on_line or any(id(d[1]) not in dflt for d in on_line):
+                        return "header"
+                    if self.in_import_fn(rel, ln):
+                        return "header-import"
+                    for d in on_line:
+                        a, b = dflt[id(d[1])]
+                        out.update(range(a, b + 1))
+                    continue
+                if lam and (fn is None or lam[0] >= fn[0]):
+                    # A lambda body runs only when the lambda is called (class tables are built
+                    # at import, but tests never re-run class bodies).
+                    if fn is None and not lambda_body_only(old_tree, new_tree):
+                        return "lambda-table"
+                    if fn is not None and (self.in_import_fn(rel, ln) or self.ran_at_import(rel, old_tree, ln)):
+                        return "lambda-import"
+                    out.update(range(lam[0], lam[1] + 1))
+                    continue
+                if fn is None:
+                    return "classbody"
+                if ln in headers:
+                    return "header"
+                if self.in_import_fn(rel, ln) or self.ran_at_import(rel, old_tree, ln):
+                    return "import"
+                span = statement_span(old_tree, ln) or (ln, ln)
+                out.update(range(span[0], span[1] + 1))
+            overlay[rel] = new_src
+        if not overlay:
+            return "nothing"
+        return lines, overlay, keep
+
+    def _tree(self, rel: str):
+        memo = self.__dict__.setdefault("_tree_memo", {})
+        if rel not in memo:
+            src = self.source(rel)
+            try:
+                memo[rel] = ast.parse(src) if src is not None else None
+            except SyntaxError:
+                memo[rel] = None
+        return memo[rel]
+
+    def _stmt_data(self):
+        d = self.__dict__.get("_sm")
+        if d is None:
+            import marshal
+            import zlib
+            if not STMT_MAP.exists():
+                d = {}
+            else:
+                d = marshal.loads(zlib.decompress(STMT_MAP.read_bytes()))
+            self._sm = d
+        return d
+
+    def stmt_entry(self, tid: str):
+        memo = self.__dict__.setdefault("_sm_memo", {})
+        if tid in memo:
+            return memo[tid]
+        import marshal
+        import zlib
+        blob = self._stmt_data().get("tests", {}).get(tid)
+        e = None
+        if blob is not None:
+            e = marshal.loads(zlib.decompress(blob))
+            acc, lines = 0, []
+            for x in e["d"]:
+                acc += x
+                lines.append(acc)
+            e["lines"] = lines
+        memo[tid] = e
+        return e
+
+    def _probe_mod(self):
+        """tools/stmt_probe.py, loaded into this process with sqlglot and the test helpers (once):
+        each probe then forks from here instead of starting and importing everything again."""
+        mod = self.__dict__.get("_probe")
+        if mod is None:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("stmt_probe", STMT_PROBE)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.prepare(SRC.resolve())
+            self._probe = mod
+        return mod
+
+    def stmt_probe(self, out: set[int], files: list[dict]) -> tuple[set[int], str]:
+        loc = self.local_lines(files)
+        if isinstance(loc, str):
+            return set(), "nl-" + loc
+        changed, overlay, keep = loc
+        data = self._stmt_data()
+        if not data:
+            return set(), ""
+        fids = data["files"]
+        enc = sorted(fids[rel] * 100000 + ln for rel, lns in changed.items() if rel in fids for ln in lns)
+        num_to_test = {t["number"]: t for t in self.tests}
+        impact = set()
+        for rel, lns in changed.items():
+            impact |= self.cov(rel, lns)
+        tpcds = self.by_id.get(TPCDS_TEST)
+        static, jobs = set(), []
+        tally = {"exempt": 0, "noent": 0, "zero-in-impact": 0, "setup": 0}
+        for n in sorted(out):
+            t = num_to_test[n]
+            if n == tpcds or t["file"] in NO_STMT_PROBE or n in keep:
+                tally["exempt"] += 1
+                continue
+            e = self.stmt_entry(t["id"])
+            if e is None or not e["ok"]:
+                tally["noent"] += 1
+                continue
+            lines, masks, mids = e["lines"], e["masks"], e["m"]
+            mask = 0
+            for x in enc:
+                i = bisect.bisect_left(lines, x)
+                if i < len(lines) and lines[i] == x:
+                    mask |= masks[mids[i]]
+            ctx = e["ctx"]
+            if not mask:
+                if n not in impact:
+                    static.add(n)
+                else:
+                    tally["zero-in-impact"] += 1
+                continue
+            full, cases, t_need, t_all = set(), {}, 0.0, 0.0
+            setup = False
+            for i, (stmt, cf, ck, secs) in enumerate(ctx):
+                t_all += secs
+                if not (mask >> i) & 1:
+                    continue
+                t_need += secs
+                if stmt < 0:
+                    setup = True
+                elif cf is None:
+                    full.add(stmt)
+                else:
+                    cases.setdefault(stmt, {}).setdefault(cf, []).append(ck)
+            if setup:
+                tally["setup"] += 1
+                continue
+            for stmt in full:
+                cases.pop(stmt, None)
+            # kept-for-binding statements: their statement-level time
+            scale = t["seconds"] / t_all if t_all > 0 else 1.0
+            est = t_need * scale
+            jobs.append((PROBE_PER_TEST_S + PROBE_SAFETY * est, n, {"id": t["id"], "full": sorted(full),
+                                  "exposure": bin(mask).count("1"),
+                                  "cases": {str(k): v for k, v in cases.items()}}))
+        if not jobs:
+            return static, "nojobs:" + ",".join(f"{k}={v}" for k, v in tally.items() if v)
+        ms = {x: round(num_to_test[x]["seconds"] * 1000) for x in out}
+
+        def cost(sel):
+            if not sel:
+                return 0.0
+            ws = split(set(sel), ms)
+            return (max(sum(ms[x] for x in w) for w in ws) + WORKER_MS * len(ws)) / 1000
+
+        base = out - static
+        c0 = cost(base)
+        jobs.sort(key=lambda j: (j[0] / max(ms[j[1]], 1), j[0]))
+        best, best_gain, acc = 0, 0.0, 0.0
+        chosen = set()
+        for i, (est, n, _job) in enumerate(jobs, 1):
+            acc += est
+            chosen.add(n)
+            gain = c0 - cost(base - chosen) - PROBE_RATIO * (PROBE_START_S + acc)
+            if gain > best_gain:
+                best, best_gain = i, gain
+        if best == 0:
+            return static, "static" if static else "skip"
+        pick = jobs[:best]
+        cpu_est = PROBE_START_S + sum(j[0] for j in pick)
+        order = sorted(pick, key=lambda j: -j[2]["exposure"])  # likeliest to break first
+        job = {"overlay": overlay, "tests": [j[2] for j in order], "failfast": True,
+               "trees": {rel: self._patched[rel][:2] for rel in overlay if rel in self._patched}}
+        raw_gain = best_gain + PROBE_RATIO * cpu_est
+        budget = max(1.5 * cpu_est + 0.3, min(0.8 * raw_gain, 3 * cpu_est + 0.5))
+        allow = probe_allowance()
+        if allow < 1.5 * cpu_est + 0.3:
+            return static, "time"
+        budget = min(budget, allow)
+        res: dict = {}
+        cpu = 0.0
+        try:
+            probe = self._probe_mod()
+            res, cpu = probe.run_forked(job, budget)
+        except Exception as e:  # noqa: BLE001
+            log(f"stmt probe failed: {type(e).__name__}: {e}")
+        passed = {n for _est, n, job in pick if res.get(job["id"]) is True}
+        real = c0 - cost(base - passed)
+        log(f"stmt probe est={cpu_est:.2f}s cpu={cpu:.2f}s ran={len(res)}/{len(pick)} "
+            f"pass={len(passed)} gain_est={best_gain:.1f} gain={real:.1f} n={len(out)} c0={c0:.1f}")
+        return static | passed, f"probe{len(pick)}"
 
 
 # -- fast tree helpers. ast.walk/ast.dump are pure Python and were most of the runtime CPU.
@@ -1839,6 +2115,20 @@ def split(selected: set[int], ms: dict[int, int]) -> list[list[int]]:
     return [sorted(b) for b in best[1] if b]
 
 
+RUN_LIMIT_S = float(os.environ.get("RUN_LIMIT_S", "180"))  # wall time for the whole batch (4.5 min in the final)
+T0 = __import__("time").monotonic()
+LEFT = {"commits": 1}
+
+
+def probe_allowance() -> float:
+    """Wall seconds a probe may take now: what is left of 60% of the batch's time limit (the
+    limit scales with the batch: 3 min for ~30 commits, 4.5 for ~45), keeping 1 s for each
+    commit still to answer."""
+    import time
+    limit = 0.6 * RUN_LIMIT_S * (1.5 if LEFT.get("total", 0) > 37 else 1.0)
+    return limit - (time.monotonic() - T0) - 1.0 * LEFT["commits"]
+
+
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
@@ -1848,7 +2138,10 @@ def main() -> None:
     except Exception as e:  # map unreadable: run everything on every commit rather than print nothing
         log(f"selector init failed: {type(e).__name__}: {e}")
         sel = None
-    for patch in sorted((DATA / "commits").glob("*.patch")):
+    patches = sorted((DATA / "commits").glob("*.patch"))
+    LEFT["total"] = len(patches)
+    for i, patch in enumerate(patches):
+        LEFT["commits"] = len(patches) - i
         try:
             if sel is None:
                 raise RuntimeError("no selector")
