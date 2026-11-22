@@ -5,13 +5,14 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 # selector reads the original sources to apply each patch and compare syntax trees.
 # No tests run at build time.
 ARG PIN=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
-COPY tools/fetch_src.py tools/build_index.py tools/tpc_probe.py tools/stmt_probe.py /app/tools/
+COPY tools/fetch_src.py /app/tools/
 RUN python /app/tools/fetch_src.py "$PIN" /app/src
 # The labeling environment (requirements.lock is it, on this base image): the statement probe runs
 # parts of sqlglot's tests in-process, which import duckdb, pandas and pytz.
 COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -q -r /app/requirements.lock
 
+COPY tools/build_index.py tools/tpc_probe.py tools/stmt_probe.py /app/tools/
 COPY selector.py /app/selector.py
 COPY maps /app/maps
 # Static index of import-time code (class tables, dialect families); build CPU is not charged.
@@ -26,10 +27,16 @@ RUN (python /app/tools/build_index.py /app/src /app/maps/index.json || echo "ind
 RUN (PYTHONHASHSEED=0 python /app/tools/tpc_probe.py /app/src --baseline > /tmp/tpc_base.json \
      && mv /tmp/tpc_base.json /app/maps/tpc_base.json || echo "tpc baseline failed; probe off") \
  && chmod -R a+rX /app
+# Per-query cold line coverage of the same three calls: the runtime probe recomputes only the
+# queries an edit can reach and keeps the baseline fingerprint for the rest. Optional.
+RUN (PYTHONHASHSEED=0 python /app/tools/tpc_probe.py /app/src --qcov > /tmp/tpc_qcov.json \
+     && mv /tmp/tpc_qcov.json /app/maps/tpc_qcov.json || echo "tpc qcov failed; probe runs every query") \
+ && chmod -R a+rX /app
 
 # Bytecode for the sources the probes import (the disk is read-only at run time, so without it
 # every probe would compile sqlglot again).
-RUN python -m compileall -q -j 0 /app/src/sqlglot /app/src/tests /app/tools && chmod -R a+rX /app
+RUN python -m compileall -q -j 0 /app/src/sqlglot /app/src/tests /app/tools /app/selector.py && chmod -R a+rX /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
-CMD ["python", "-S", "/app/selector.py"]
+# Imported, not run as a script: a script is compiled on every start, a module loads its .pyc.
+CMD ["python", "-S", "-c", "import sys; sys.path.insert(0, '/app'); import selector; selector.entry()"]

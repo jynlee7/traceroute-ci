@@ -16,6 +16,11 @@ happens in this process, inside its own context.
 
 Per test the map stores, for every sqlglot line it ran, the set of contexts that ran it (bitsets
 deduplicated), each context's seconds, and whether the test passed at the pin.
+
+Reads of an expression class's own `arg_types` dict (also through subclasses that inherit it) and of
+`required_args` derived from it are recorded too, as line 1 of the pseudo-file "@argt/<Class>": the
+containers are swapped for recording subclasses. Reads outside a test's monitored window (module
+imports) go to the map's "argt_import" list instead.
 """
 
 import ast
@@ -61,6 +66,10 @@ class State:
         self.times: dict[tuple, float] = {}
         self.last = time.perf_counter()
         self.titles: dict[tuple, set] = {}
+        self.active = False  # inside a monitored window (setUpClass or a test run)
+        self.root = ""
+        self.argt: dict[str, int] = {}
+        self.argt_import: set[str] = set()
 
     @property
     def ctx(self):
@@ -78,6 +87,79 @@ class State:
 ST: State = None  # type: ignore
 TOOL = 4
 DISABLE = sys.monitoring.DISABLE
+
+
+def argt_read(owner: str) -> None:
+    st = ST
+    if st is None:
+        return
+    if not st.active:
+        st.argt_import.add(owner)
+        return
+    fid = st.argt.get(owner)
+    if fid is None:
+        fn = f"{st.root}/@argt/{owner}"
+        fid = st.files.get(fn)
+        if fid is None:
+            fid = st.files[fn] = len(st.files)
+        st.argt[owner] = fid
+    st.hits.setdefault(st.ctx, set()).add(fid * 100000 + 1)
+
+
+def _rec(name, base):
+    def method(self, *a, **k):
+        argt_read(self._owner)
+        return getattr(base, name)(self, *a, **k)
+    method.__name__ = name
+    return method
+
+
+class RecDict(dict):
+    """A class's own arg_types: every read is recorded for the class that defines it."""
+    __slots__ = ("_owner",)
+
+
+for _n in ("__getitem__", "__contains__", "__iter__", "__len__", "__reversed__", "__eq__", "__ne__",
+           "__or__", "__ror__", "get", "keys", "items", "values", "copy", "__repr__"):
+    setattr(RecDict, _n, _rec(_n, dict))
+RecDict.__hash__ = None
+
+
+class RecSet(set):
+    """required_args derived from some class's arg_types: reads recorded for that class."""
+    __slots__ = ("_owner",)
+
+
+for _n in ("__contains__", "__iter__", "__len__", "__eq__", "__ne__", "__le__", "__lt__", "__ge__",
+           "__gt__", "__sub__", "__rsub__", "__and__", "__rand__", "__or__", "__ror__", "__xor__",
+           "__rxor__", "issubset", "issuperset", "isdisjoint", "difference", "intersection", "union",
+           "symmetric_difference", "copy", "__repr__"):
+    setattr(RecSet, _n, _rec(_n, set))
+RecSet.__hash__ = None
+
+
+def wrap_arg_types() -> None:
+    """Swap every expression class's own arg_types / required_args for recording containers
+    (classes defined since the last call included)."""
+    from sqlglot.expressions.core import Expr
+    stack, seen = [Expr], set()
+    while stack:
+        k = stack.pop()
+        if k in seen:
+            continue
+        seen.add(k)
+        stack.extend(k.__subclasses__())
+        own = k.__dict__.get("arg_types")
+        if type(own) is dict:
+            d = RecDict(own)
+            d._owner = k.__name__
+            setattr(k, "arg_types", d)
+        req = k.__dict__.get("required_args")
+        if type(req) is set:
+            owner = next((c.__name__ for c in k.__mro__ if "arg_types" in c.__dict__), k.__name__)
+            r = RecSet(req)
+            r._owner = owner
+            setattr(k, "required_args", r)
 
 
 def on_line(code, line):
@@ -209,7 +291,9 @@ def run(src: Path, tests_json: Path, out_dir: Path, shard: int, nshards: int):
         by_class.setdefault((t["file"], parts[1]), []).append(t)
     keys = sorted(by_class)[shard::nshards]
     ST = State(str(src / "sqlglot") + "/")
+    ST.root = str(src)
     import tests.helpers as helpers  # noqa: E402
+    wrap_arg_types()
 
     lp, lf = helpers.load_sql_fixture_pairs, helpers.load_sql_fixtures
     wp, wf = wrap_loader(lp, True), wrap_loader(lf, False)
@@ -234,17 +318,20 @@ def run(src: Path, tests_json: Path, out_dir: Path, shard: int, nshards: int):
         cls = getattr(mod, cname, None)
         if cls is None:
             continue
+        wrap_arg_types()
         class_hits: dict = {}
         ST.code, ST.spans = None, []
         ST.hits, ST.times = {}, {}
         ST.stmt, ST.case = SETUP, None
         mon.set_events(TOOL, mon.events.LINE)
+        ST.active = True
         setup_ok = True
         try:
             cls.setUpClass()
         except Exception as e:
             print(f"setUpClass {cname} failed: {e}", file=sys.stderr)
             setup_ok = False
+        ST.active = False
         mon.set_events(TOOL, 0)
         class_hits = ST.hits.get((SETUP, None), set())
         for k, v in list(vars(cls).items()):
@@ -255,6 +342,7 @@ def run(src: Path, tests_json: Path, out_dir: Path, shard: int, nshards: int):
             func = getattr(cls, mname, None)
             if func is None:
                 continue
+            wrap_arg_types()  # expression classes a lazily imported dialect defined meanwhile
             inner = unwrap(func)
             spans = method_spans(inner) or []
             ST.code, ST.spans = inner.__code__, spans
@@ -278,9 +366,11 @@ def run(src: Path, tests_json: Path, out_dir: Path, shard: int, nshards: int):
             res = unittest.TestResult()
             mon.restart_events()
             mon.set_events(TOOL, mon.events.LINE)
+            ST.active = True
             try:
                 inst.run(res)
             finally:
+                ST.active = False
                 mon.set_events(TOOL, 0)
                 ST.switch(SETUP, None)
             ok = setup_ok and res.wasSuccessful() and not res.skipped
@@ -295,7 +385,8 @@ def run(src: Path, tests_json: Path, out_dir: Path, shard: int, nshards: int):
         except Exception:
             pass
     files = {v: k[len(str(src)) + 1:] for k, v in ST.files.items()}
-    (out_dir / f"part{shard}.marshal").write_bytes(marshal.dumps({"files": files, "tests": out}))
+    (out_dir / f"part{shard}.marshal").write_bytes(
+        marshal.dumps({"files": files, "tests": out, "argt_import": sorted(ST.argt_import)}))
     print(f"shard {shard}: {len(out)} tests", file=sys.stderr)
 
 
@@ -303,8 +394,10 @@ def merge(out_dir: Path, dest: Path):
     """Re-number files globally; one zlib blob per test."""
     files: dict[str, int] = {}
     tests = {}
+    argt_import: set[str] = set()
     for p in sorted(out_dir.glob("part*.marshal")):
         d = marshal.loads(p.read_bytes())
+        argt_import.update(d.get("argt_import", ()))
         remap = {}
         for fid, rel in d["files"].items():
             remap[fid] = files.setdefault(rel, len(files))
@@ -321,7 +414,7 @@ def merge(out_dir: Path, dest: Path):
             deltas = [lines[0]] + [b - a for a, b in zip(lines, lines[1:])] if lines else []
             blob = {"ok": e["ok"], "ctx": e["ctx"], "masks": e["masks"], "d": deltas, "m": mids}
             tests[tid] = zlib.compress(marshal.dumps(blob), 9)
-    data = {"files": files, "tests": tests}
+    data = {"files": files, "tests": tests, "argt_import": sorted(argt_import)}
     dest.write_bytes(zlib.compress(marshal.dumps(data), 1))
     print(f"{len(tests)} tests, {dest.stat().st_size / 1e6:.1f} MB", file=sys.stderr)
 

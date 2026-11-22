@@ -848,6 +848,10 @@ def attr_read_tables(root: Path, trees: dict, _all_dialect_tests) -> dict:
                     entry.append(kw.arg)  # passed on as kw.arg=...: its real readers are downstream
                     hops.add(kw.arg)
                 reads.setdefault(n.attr, []).append(entry)
+                if n.lineno != entry[1]:
+                    # A multi-line statement: coverage has the lines that ran, and the read's own line
+                    # runs with it (`elif (\n not self.X ...` runs line 2, never the `elif` line).
+                    reads[n.attr].append([rel, n.lineno] + entry[2:])
             elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in consts and cls and not in_fn:
                 reads.setdefault(n.id, []).append([rel, stmt_line(n), "top", f"class:{cls}", keyonly(n, parents)])
             elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in consts:
@@ -880,7 +884,7 @@ def attr_read_tables(root: Path, trees: dict, _all_dialect_tests) -> dict:
                         if isinstance(p, ast.Assign) and p.value is n and all(
                                 isinstance(tg, ast.Attribute) and tg.attr == n.id for tg in p.targets):
                             continue  # self.K = K: a pass-through, read later as .K (recorded below)
-                        hop_reads.setdefault(n.id, []).append([rel, start(n), "fn"])
+                        hop_reads.setdefault(n.id, []).extend([rel, ln, "fn"] for ln in {start(n), n.lineno})
         slot_strings = set()
         for n in ast.walk(tree):
             if isinstance(n, (ast.Assign, ast.AnnAssign)) and any(
@@ -902,9 +906,10 @@ def attr_read_tables(root: Path, trees: dict, _all_dialect_tests) -> dict:
                     if sum(not isinstance(x.ctx, ast.Load) for x in uses) == 1:
                         for x in uses:
                             if isinstance(x.ctx, ast.Load):
-                                hop_reads.setdefault(n.attr, []).append([rel, start(x), "fn"])
+                                hop_reads.setdefault(n.attr, []).extend([rel, ln, "fn"] for ln in {start(x), x.lineno})
                         continue
-                hop_reads.setdefault(n.attr, []).append([rel, start(n), "fn" if cur is not None else "top"])
+                hop_reads.setdefault(n.attr, []).extend(
+                    [rel, ln, "fn" if cur is not None else "top"] for ln in {start(n), n.lineno})
             elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in hops and id(n) not in slot_strings:
                 hop_reads.setdefault(n.value, []).append([rel, n.lineno, "dyn"])
 

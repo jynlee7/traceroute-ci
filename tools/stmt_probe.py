@@ -61,38 +61,116 @@ class _LazyConn:
 
     def _get(self):
         if self._real is None:
-            import importlib
-            real = importlib.import_module("duckdb")
+            real = _load_real("duckdb")  # not import_module: that returns the lazy stub again
             self._real = real.connect(*self._args[0], **self._args[1])
             for name, a, k in self._calls:
                 getattr(self._real, name)(*a, **k)
         return self._real
 
     def execute(self, *a, **k):
+        r = _LazyResult(self, a, k)
         if self._real is None:
-            self._calls.append(("execute", a, k))
-            return _LazyResult(self, a, k)
-        return self._real.execute(*a, **k)
+            self._calls.append(("execute", a, k))  # replayed when duckdb loads
+        else:
+            r._res = self._real.execute(*a, **k)  # runs now, read or not (DDL, inserts)
+        return r
 
     def __getattr__(self, name):
         return getattr(self._get(), name)
 
 
 class _LazyResult:
-    """What conn.execute() returned before duckdb loaded: replays on first use."""
+    """What conn.execute() returned: before duckdb loaded, it replays on first use; .df() gives a
+    _Frame (rows, no pandas)."""
 
     def __init__(self, conn, a, k):
-        self._conn, self._a, self._k = conn, a, k
+        self._conn, self._a, self._k, self._res = conn, a, k, None
+
+    def _run(self):
+        if self._res is None:
+            conn = self._conn
+            # Recorded before duckdb loaded. It is replayed with the others unless it was the
+            # last call, which runs here instead, so its result is what the test reads.
+            if conn._calls and conn._calls[-1][1] == self._a:
+                conn._calls.pop()
+            conn._get()
+            self._res = conn._real.execute(*self._a, **self._k)
+        return self._res
+
+    def df(self):
+        res = self._run()
+        conn, a, k = self._conn, self._a, self._k
+        return _Frame(res, lambda: conn._real.execute(*a, **k).df())
 
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
-        conn = self._conn
-        # the recorded call is the last one replayed; re-run it to get its result
-        if conn._calls and conn._calls[-1][1] == self._a:
-            conn._calls.pop()
-        real = conn._get()
-        return getattr(real.execute(*self._a, **self._k), name)
+        return getattr(self._run(), name)
+
+
+# DuckDB column types whose rows convert to a DataFrame without surprises: equal names, types and
+# rows then mean equal frames. Anything else goes to pandas.
+_PLAIN = ("BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER",
+          "UBIGINT", "FLOAT", "DOUBLE", "VARCHAR", "DATE", "DECIMAL", '"NULL"', "NULL")
+
+
+class _Frame:
+    """What .df() returns in a probe: column names, DuckDB types and fetchall() rows. Becomes the
+    real DataFrame (the query re-run, pandas imported) for any other use."""
+
+    def __init__(self, res, real_df):
+        self.names = tuple(d[0] for d in res.description)
+        self.types = tuple(str(d[1]) for d in res.description)
+        self.rows = res.fetchall()
+        self._real_df, self._df = real_df, None
+
+    def plain(self) -> bool:
+        return all(t.split("(")[0] in _PLAIN for t in self.types)
+
+    def real(self):
+        if self._df is None:
+            self._df = self._real_df()
+        return self._df
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.real(), name)
+
+    def __len__(self):
+        return len(self.real())
+
+    def __getitem__(self, key):
+        return self.real()[key]
+
+    def __iter__(self):
+        return iter(self.real())
+
+
+def _assert_frame_equal(*args, **kw):
+    """pandas.testing.assert_frame_equal, decided without pandas when two probe frames are
+    identical (names, types, rows) in plain types; pandas decides everything else."""
+    if not kw and len(args) == 2 and all(isinstance(x, _Frame) for x in args):
+        a, b = args
+        if a.names == b.names and a.types == b.types and a.plain() and a.rows == b.rows:
+            return None
+    real = _load_real("pandas.testing")
+    return real.assert_frame_equal(*[x.real() if isinstance(x, _Frame) else x for x in args], **kw)
+
+
+def _load_real(name: str):
+    """The real module behind a lazy stub: stop serving stubs, drop them, import for real."""
+    import importlib
+    if os.environ.get("PROBE_VERBOSE"):
+        print(f"LOAD_REAL {name}", file=sys.stderr)
+    for f in sys.meta_path:
+        if isinstance(f, _LazyFinder):
+            f.active = False
+    root = name.split(".")[0]
+    for n in list(sys.modules):
+        if (n == root or n.startswith(root + ".")) and getattr(sys.modules[n], "__lazy__", False):
+            del sys.modules[n]
+    return importlib.import_module(name)
 
 
 class _LazyFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -111,17 +189,9 @@ class _LazyFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
     def exec_module(self, module):
         name = module.__name__
-        finder = self
 
         def real():
-            finder.active = False
-            for n in list(sys.modules):
-                if n == name or n.startswith(name.split(".")[0] + "."):
-                    if isinstance(sys.modules[n], types.ModuleType) and getattr(sys.modules[n], "__lazy__", False):
-                        del sys.modules[n]
-            sys.modules.pop(name.split(".")[0], None)
-            import importlib
-            return importlib.import_module(name)
+            return _load_real(name)
 
         module.__lazy__ = True
         if name == "duckdb":
@@ -133,7 +203,7 @@ class _LazyFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             if attr.startswith("__"):
                 raise AttributeError(attr)
             if name == "pandas.testing" and attr == "assert_frame_equal":
-                return lambda *a, **k: real().assert_frame_equal(*a, **k)
+                return _assert_frame_equal
             return getattr(real(), attr)
 
         module.__getattr__ = __getattr__
@@ -152,6 +222,15 @@ class SyncExec:
 
     def shutdown(self, *a, **k):
         pass
+
+    def map(self, fn, *its, **k):
+        return [fn(*a) for a in zip(*its)]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
 
 
 def names(node, ctx) -> set:
@@ -304,6 +383,11 @@ def run_one(job, mods) -> bool:
     while hasattr(rf, "__wrapped__"):
         rf = rf.__wrapped__
     CUR["code"], CUR["spans"], CUR["cases"] = rf.__code__, spans, {j: cases[j] for j in cases if j not in full}
+    for pool in ("ProcessPoolExecutor", "ThreadPoolExecutor"):
+        # setUpClass would start a real pool (a spawn context starts a resource-tracker process
+        # even before any submit); this child is disposable, so run submissions inline.
+        if isinstance(ns.get(pool), type):
+            ns[pool] = mod.__dict__[pool] = lambda *a, **k: SyncExec()
     red.setUpClass()
     try:
         for k, v in list(vars(red).items()) + list(vars(cls).items()):
@@ -417,65 +501,22 @@ def _class_assigns(tree):
     return out
 
 
-def _functions_from(path: str):
-    """Function objects defined in `path`, reachable from sqlglot and test modules: module and
-    class namespaces, containers (class tables), wrappers, partials and closure cells."""
-    import functools
-    seen, out = set(), []
-    stack = [m.__dict__ for n, m in list(sys.modules.items())
-             if m is not None and (n == "sqlglot" or n.startswith(("sqlglot.", "tests")))]
-    FT = types.FunctionType
-    while stack:
-        o = stack.pop()
-        i = id(o)
-        if i in seen:
-            continue
-        seen.add(i)
-        t = type(o)
-        if t is FT:
-            if path is None or o.__code__.co_filename == path:
-                out.append(o)
-            if o.__closure__:
-                for cell in o.__closure__:
-                    try:
-                        stack.append(cell.cell_contents)
-                    except ValueError:
-                        pass
-            w = o.__dict__.get("__wrapped__")
-            if w is not None:
-                stack.append(w)
-        elif t is dict:
-            stack.extend(o.values())
-        elif t in (list, tuple, set, frozenset):
-            stack.extend(o)
-        elif isinstance(o, type):
-            if getattr(o, "__module__", "").startswith(("sqlglot", "tests")):
-                stack.extend(vars(o).values())
-        elif t in (staticmethod, classmethod):
-            stack.append(o.__func__)
-        elif t is property:
-            stack.extend((o.fget, o.fset, o.fdel))
-        elif t is functools.partial:
-            stack.append(o.func)
-            stack.extend(o.args)
-            stack.extend(o.keywords.values())
-        elif t is types.MethodType:
-            stack.append(o.__func__)
-    return out
-
-
-_FUNCS = {"key": None, "by_file": {}}
+_FUNCS = {"by_file": {}}
 
 
 def function_index() -> dict:
-    """filename -> live function objects (cached until another sqlglot module is loaded)."""
-    key = frozenset(n for n in sys.modules if n == "sqlglot" or n.startswith(("sqlglot.", "tests")))
-    if _FUNCS["key"] != key:
-        by_file: dict = {}
-        for f in _functions_from(None):
-            by_file.setdefault(f.__code__.co_filename, []).append(f)
-        _FUNCS["key"], _FUNCS["by_file"] = key, by_file
-    return _FUNCS["by_file"]
+    """filename -> every live function object (gc.get_objects: ~10 ms, and complete where a walk
+    from module namespaces is not, e.g. a lambda held only in another function's __defaults__).
+    Rebuilt on each call: imports and lazy caches add functions between probes."""
+    import gc
+    gc.unfreeze()  # frozen objects are invisible to get_objects
+    FT = types.FunctionType
+    by_file: dict = {}
+    for o in gc.get_objects():
+        if type(o) is FT:
+            by_file.setdefault(o.__code__.co_filename, []).append(o)
+    _FUNCS["by_file"] = by_file
+    return by_file
 
 
 def _code_key(c):
@@ -483,12 +524,13 @@ def _code_key(c):
     return (c.co_qualname, c.co_firstlineno, col)
 
 
-def hot_patch(src: Path, overlay: dict, trees: dict | None = None) -> None:
+def hot_patch(src: Path, overlay: dict, trees: dict | None = None, funcs: dict | None = None) -> None:
     """Make the loaded pinned modules behave like the patched sources (leaf-only edits): swap the
     code of every function object, set changed literal defaults and class constants. Modules not
     loaded yet import from the overlay. Raises when an edit can't be applied exactly."""
     pending = {}
-    funcs = function_index()
+    if funcs is None:  # the forked child gets the parent's index: a rescan would touch every object
+        funcs = function_index()
     for rel, new_src in overlay.items():
         name = rel[:-3].replace("/", ".")
         if name.endswith(".__init__"):
@@ -539,6 +581,14 @@ def hot_patch(src: Path, overlay: dict, trees: dict | None = None) -> None:
                 ast.fix_missing_locations(expr)
                 value = eval(compile(expr, path, "eval"), mod.__dict__, dict(vars(holder)))
                 setattr(holder, attr, value)
+                if attr == "arg_types" and isinstance(holder, type) and "required_args" in vars(holder):
+                    # Expr.__init_subclass__ derived required_args from it when each class was
+                    # created: redo that for the class and every subclass inheriting its dict.
+                    stack = [holder]
+                    while stack:
+                        k = stack.pop()
+                        k.required_args = {a for a, req in k.arg_types.items() if req}
+                        stack.extend(c for c in k.__subclasses__() if "arg_types" not in vars(c))
     if pending:
         sys.meta_path.insert(0, Overlay(src, pending))
 
@@ -550,19 +600,29 @@ def run_forked(job: dict, deadline_s: float) -> tuple[dict, float]:
     import time
     src = _READY["src"]
     preload({t["id"].split("::")[0] for t in job["tests"]})
-    function_index()
+    funcs = function_index()
     sys.stdout.flush()
     sys.stderr.flush()
+    gc_mode = os.environ.get("PROBE_GC", "freeze")
+    if gc_mode != "plain":
+        # Without this the child's first full collection walks (and refcount-touches) the whole
+        # inherited heap: copy-on-write faults on nearly every page, charged as child CPU.
+        import gc
+        gc.collect()
+        gc.freeze()
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:  # child
         code = 0
+        if gc_mode != "plain":
+            import gc
+            gc.disable()  # short-lived, memory-capped by the run; cycles die with the process
         try:
             os.close(r)
             os.chdir(src)
             sys.stdout = sys.stderr
             _t0 = time.process_time()
-            hot_patch(src, job["overlay"], job.get("trees"))
+            hot_patch(src, job["overlay"], job.get("trees"), funcs)
             if os.environ.get("PROBE_VERBOSE"):
                 print(f"PATCH {time.process_time() - _t0:.3f}", file=sys.stderr)
             for t in job["tests"]:

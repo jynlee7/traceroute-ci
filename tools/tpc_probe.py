@@ -108,40 +108,99 @@ def run_query(root: Path, sql: str, schema_dict, cache: dict) -> str:
     return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
 
-def main() -> None:
-    root = Path(sys.argv[1]).resolve()
-    baseline = len(sys.argv) > 2 and sys.argv[2] == "--baseline"
-    sources = json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 and not baseline else {}
-    base = json.loads(Path(sys.argv[3]).read_text()) if len(sys.argv) > 3 else None
-    sys.path.insert(0, str(root))
-    if sources:
-        sys.meta_path.insert(0, Overlay(root, sources))
-    start = time.process_time()
+def fingerprint(sql: str) -> str:
+    """parse_one, optimize and transpile(write="duckdb") of one query, as one hash."""
     from sqlglot import parse_one, transpile
     from sqlglot.optimizer import optimize
     from sqlglot.schema import ensure_schema
     from sqlglot.serde import dump
+    from tests.helpers import TPCDS_SCHEMA
+
+    parts = []
+    try:
+        parsed = parse_one(sql)
+        parts.append(dump(parsed))
+        schema = ensure_schema(TPCDS_SCHEMA, dialect=None)
+        parts.append(dump(optimize(parsed, schema, leave_tables_isolated=True, dialect=None)))
+    except Exception as e:  # noqa: BLE001 - the test would error the same way
+        parts.append(f"error {type(e).__name__}: {e}")
+    try:
+        parts.append(transpile(sql, write="duckdb")[0])
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"error {type(e).__name__}: {e}")
+    blob = json.dumps(parts, sort_keys=True, default=repr)
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+
+
+def query_coverage(root: Path, sqls: list[str]) -> dict:
+    """Build time: for each query, the sqlglot lines fingerprint() runs, each query in a fresh fork
+    of a process that has only imported sqlglot. Cold, so a query that would read lazily cached
+    state (dispatch tables, per-type caches) runs the code that computes it and shows it here.
+    -> {repo path: {line: bitmask of query indexes}}"""
+    import os
+    prefix = str(root / "sqlglot") + "/"
+    cut = len(str(root)) + 1
+    cov: dict = {}
+    for i, sql in enumerate(sqls):
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            mon = sys.monitoring
+            hits = set()
+
+            def on_line(code, line):
+                f = code.co_filename
+                if f.startswith(prefix):
+                    hits.add((f[cut:], line))
+                return mon.DISABLE
+
+            mon.use_tool_id(mon.COVERAGE_ID, "tpc-qcov")
+            mon.register_callback(mon.COVERAGE_ID, mon.events.LINE, on_line)
+            mon.set_events(mon.COVERAGE_ID, mon.events.LINE)
+            fingerprint(sql)
+            mon.set_events(mon.COVERAGE_ID, 0)
+            with os.fdopen(w, "w") as fh:
+                json.dump(sorted(hits), fh)
+            os._exit(0)
+        os.close(w)
+        with os.fdopen(r) as fh:
+            data = fh.read()
+        _, status = os.waitpid(pid, 0)
+        if status != 0:
+            raise RuntimeError(f"coverage of query {i} failed")
+        for f, ln in json.loads(data):
+            d = cov.setdefault(f, {})
+            d[ln] = d.get(ln, 0) | (1 << i)
+    return cov
+
+
+def main() -> None:
+    root = Path(sys.argv[1]).resolve()
+    baseline = len(sys.argv) > 2 and sys.argv[2] == "--baseline"
+    qcov = len(sys.argv) > 2 and sys.argv[2] == "--qcov"
+    sources = json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 and not (baseline or qcov) else {}
+    base = json.loads(Path(sys.argv[3]).read_text()) if len(sys.argv) > 3 else None
+    # Optional 4th argument: comma-separated query indexes to recompute; the others keep BASE's
+    # fingerprint (the selector passes the queries whose cold coverage reaches the edit).
+    only = None
+    if len(sys.argv) > 4 and base is not None:
+        only = {int(x) for x in sys.argv[4].split(",") if x}
+    sys.path.insert(0, str(root))
+    if sources:
+        sys.meta_path.insert(0, Overlay(root, sources))
+    start = time.process_time()
+    import sqlglot  # noqa: F401
     from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
 
-    out, sqls = [], []
-    for meta, sql, _ in load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"):
-        if not meta.get("execute"):
-            continue
-        sqls.append(sql)
-        parts = []
-        try:
-            parsed = parse_one(sql)
-            parts.append(dump(parsed))
-            schema = ensure_schema(TPCDS_SCHEMA, dialect=None)
-            parts.append(dump(optimize(parsed, schema, leave_tables_isolated=True, dialect=None)))
-        except Exception as e:  # noqa: BLE001 - the test would error the same way
-            parts.append(f"error {type(e).__name__}: {e}")
-        try:
-            parts.append(transpile(sql, write="duckdb")[0])
-        except Exception as e:  # noqa: BLE001
-            parts.append(f"error {type(e).__name__}: {e}")
-        blob = json.dumps(parts, sort_keys=True, default=repr)
-        out.append(hashlib.sha1(blob.encode()).hexdigest()[:16])
+    sqls = [sql for meta, sql, _ in load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql") if meta.get("execute")]
+    if qcov:
+        print(json.dumps({"n": len(sqls), "files": query_coverage(root, sqls)}))
+        return
+    if only is not None and len(base["h"]) == len(sqls):
+        out = [fingerprint(sql) if i in only else base["h"][i] for i, sql in enumerate(sqls)]
+    else:
+        out = [fingerprint(sql) for sql in sqls]
     result = {"h": out, "t": round(time.process_time() - start, 3)}
     cache: dict = {}
     if baseline:

@@ -27,6 +27,7 @@ DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", 
 TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPC_PROBE = Path(os.environ.get("TPC_PROBE", APP / "tools/tpc_probe.py"))
 TPC_BASE = Path(os.environ.get("TPC_BASE", APP / "maps/tpc_base.json"))  # tpc_probe.py on the pinned sources
+TPC_QCOV = Path(os.environ.get("TPC_QCOV", APP / "maps/tpc_qcov.json"))  # tpc_probe.py --qcov: per-query lines
 EXEC_BUDGET_S = 4.0  # tools/tpc_probe.py EXEC_BUDGET: query executions it may add
 STMT_MAP = Path(os.environ.get("STMT_MAP", APP / "maps/stmt.map"))  # tools/build_stmt_map.py
 STMT_PROBE = Path(os.environ.get("STMT_PROBE", APP / "tools/stmt_probe.py"))
@@ -1278,6 +1279,13 @@ class Selector:
                 s, r = set(self.all), "other"
             out |= s
             why.append(f"{rel}:{r}:{len(s)}")
+        # The TPC probe first: its verdict depends only on the patch, and the statement probe
+        # weighs its gains against the cost of what remains (with test_execute_tpcds, 21.5 s,
+        # still selected, dropping the small tests beside it looks worthless).
+        tpcds = self.by_id.get(TPCDS_TEST)
+        if tpcds in out and self.tpc_probe_clears(files):
+            out.discard(tpcds)
+            why.append("tpc-probe-cleared")
         if out and os.environ.get("STMT_OFF") != "1":
             try:
                 gone, how = self.stmt_probe(out, files)
@@ -1286,10 +1294,6 @@ class Selector:
             if gone or how:
                 out -= gone
                 why.append(f"stmt[{how}]-{len(gone)}")
-        tpcds = self.by_id.get(TPCDS_TEST)
-        if tpcds in out and self.tpc_probe_clears(files):
-            out.discard(tpcds)
-            why.append("tpc-probe-cleared")
         return out, why
 
     def tpc_probe_clears(self, files: list[dict]) -> bool:
@@ -1309,6 +1313,7 @@ class Selector:
         if not TPC_BASE.exists() or not TPC_PROBE.exists():
             return False
         overlay: dict[str, str] = {}
+        reach: dict[str, set[int]] = {}  # old lines whose behaviour the edit changes
         for f in files:
             rel = f["path"] or ""
             if f["binary"] or f["rename"] or f["created"] or f["deleted"] or f["old"] != rel:
@@ -1346,6 +1351,7 @@ class Selector:
                                  and min([d.lineno] + [x.lineno for x in d.decorator_list]) == s0), None)
                     if node is None or ln < node.lineno or any(x in outside for x in range(s0, e0 + 1)):
                         return False
+                    reach.setdefault(rel, set()).update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
                     continue
                 if not fn or self.ran_at_import(rel, old_tree, ln):
                     return False
@@ -1354,9 +1360,11 @@ class Selector:
                 span = statement_span(old_tree, ln) or (ln, ln)
                 if any(x in outside for x in range(span[0], span[1] + 1)):
                     return False
+                reach.setdefault(rel, set()).update(range(span[0], span[1] + 1))
             overlay[rel] = new_src
         if not overlay:
             return False
+        only = self.tpc_queries(reach)
         if probe_allowance() < 2 * json.loads(TPC_BASE.read_text()).get("t", 10) + 15:
             log("tpc probe skipped: batch time")
             return False
@@ -1366,7 +1374,11 @@ class Selector:
             tmp.write_text(json.dumps(overlay))
             limit = 2 * base["t"] + 5 + 2 * EXEC_BUDGET_S
             _t0 = os.times()
-            r = subprocess.run([sys.executable, str(TPC_PROBE), str(SRC), str(tmp), str(TPC_BASE)],
+            args = [sys.executable, str(TPC_PROBE), str(SRC), str(tmp), str(TPC_BASE)]
+            if only:
+                args.append(",".join(map(str, sorted(only))))
+            log(f"tpc probe queries {len(only) if only else 'all'}")
+            r = subprocess.run(args,
                                capture_output=True, text=True, timeout=limit + 30,
                                env=dict(os.environ, PYTHONHASHSEED="0"))
             _t1 = os.times()
@@ -1385,6 +1397,30 @@ class Selector:
                 return False
         return True
 
+
+    def tpc_queries(self, reach: dict[str, set[int]]) -> set[int] | None:
+        """TPC-DS queries whose parse/optimize/transpile runs any of these lines (cold, per query:
+        tools/tpc_probe.py --qcov). The others run unchanged code on unchanged input and keep their
+        build-time fingerprints. None (recompute all) without the map or when nothing is reached."""
+        try:
+            q = self.__dict__.get("_tpc_qcov")
+            if q is None:
+                q = self._tpc_qcov = json.loads(TPC_QCOV.read_text())
+            n = q["n"]
+            if n != len(json.loads(TPC_BASE.read_text())["h"]):
+                return None
+            mask = 0
+            for rel, lns in reach.items():
+                d = q["files"].get(rel)
+                if d is None:
+                    continue
+                for ln in lns:
+                    mask |= d.get(str(ln), 0)
+        except Exception as e:  # noqa: BLE001 - no map: recompute everything
+            log(f"tpc qcov unusable: {type(e).__name__}: {e}")
+            return None
+        only = {i for i in range(n) if (mask >> i) & 1}
+        return only or None
 
     # -- statement probe
 
@@ -1414,6 +1450,14 @@ class Selector:
             out = lines.setdefault(rel, set())
             touched = touched_old_lines(f)
             if not any(self.innermost(rel, ln)[0] or self.lambda_range(rel, ln) for ln in touched):
+                owners = self.argt_edit(old_tree, new_tree)
+                if owners:
+                    # arg_types literals: behaviour changes only where the class's dict (or the
+                    # required_args derived from it) is read; the map records those reads.
+                    for c in owners:
+                        lines.setdefault(f"@argt/{c}", set()).add(1)
+                    overlay[rel] = new_src
+                    continue
                 # Class constants: behaviour changes only where they are read at runtime.
                 sink: dict = {}
                 if self.value_edit(old_tree, new_tree, rel, sink) is None or not sink.get("lines"):
@@ -1473,6 +1517,81 @@ class Selector:
             return "nothing"
         return lines, overlay, keep
 
+    def argt_edit(self, old_tree, new_tree) -> list[str] | None:
+        """Classes whose `arg_types = {...}` literal is the only thing this file's edit changes,
+        when every one of them is an expression class whose arg_types nothing reads at import
+        (map "argt_import": a read outside every test, e.g. while a test module imports) and no
+        source names explicitly (`C.arg_types` / `C.required_args`: copies into other classes,
+        module-level sets, reads the map can't attribute). None otherwise."""
+        def assigns(tree):
+            out = {}
+            for n in walk(tree):
+                if isinstance(n, ast.ClassDef):
+                    for st in n.body:
+                        if (isinstance(st, ast.Assign) and len(st.targets) == 1
+                                and isinstance(st.targets[0], ast.Name) and st.targets[0].id == "arg_types"):
+                            out.setdefault(n.name, []).append(st)
+                        elif (isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)
+                              and st.target.id == "arg_types" and st.value is not None):
+                            out.setdefault(n.name, []).append(st)
+            return out
+
+        oa, na = assigns(old_tree), assigns(new_tree)
+        if set(oa) != set(na) or any(len(oa[c]) != 1 or len(na[c]) != 1 for c in oa):
+            return None
+        changed = [c for c in oa if ast.dump(oa[c][0].value) != ast.dump(na[c][0].value)]
+        if not changed:
+            return None
+        for c in changed:
+            v = na[c][0].value
+            if not isinstance(v, ast.Dict) or not all(isinstance(x, ast.Constant) or x is None for x in v.keys):
+                return None
+        # Nothing else in the module may differ: blank out the changed values and compare.
+        def masked(tree, table):
+            import copy
+            t2 = copy.deepcopy(tree)
+            ids = {(st.lineno, st.col_offset) for c in changed for st in table[c]}
+            for n in walk(t2):
+                if isinstance(n, (ast.Assign, ast.AnnAssign)) and (n.lineno, n.col_offset) in ids:
+                    n.value = ast.Constant(value=None)
+            return ast.dump(t2)
+        if masked(old_tree, oa) != masked(new_tree, na):
+            return None
+        data = self._stmt_data()
+        if not data or "argt_import" not in data:
+            return None
+        imported = set(data["argt_import"])
+        named = self.argt_named()
+        bases = self.index.get("class_bases", {})
+        for c in changed:
+            if c in imported or c in named:
+                return None
+            seen, stack = set(), [c]
+            while stack:
+                k = stack.pop()
+                if k in seen:
+                    continue
+                seen.add(k)
+                stack.extend(bases.get(k, []))
+            if "Expr" not in seen:
+                return None
+        return changed
+
+    def argt_named(self) -> set[str]:
+        """Names X written as `X.arg_types` or `X.required_args` anywhere in sqlglot/ (once)."""
+        got = self.__dict__.get("_argt_named")
+        if got is None:
+            import re
+            pat = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(?:arg_types|required_args)\b")
+            got = set()
+            for p in (SRC / "sqlglot").rglob("*.py"):
+                try:
+                    got.update(pat.findall(p.read_text(encoding="utf-8", errors="replace")))
+                except OSError:
+                    pass
+            self._argt_named = got
+        return got
+
     def _tree(self, rel: str):
         memo = self.__dict__.setdefault("_tree_memo", {})
         if rel not in memo:
@@ -1504,12 +1623,9 @@ class Selector:
         blob = self._stmt_data().get("tests", {}).get(tid)
         e = None
         if blob is not None:
+            from itertools import accumulate
             e = marshal.loads(zlib.decompress(blob))
-            acc, lines = 0, []
-            for x in e["d"]:
-                acc += x
-                lines.append(acc)
-            e["lines"] = lines
+            e["lines"] = list(accumulate(e["d"]))  # delta-encoded; prefix sums in C
         memo[tid] = e
         return e
 
@@ -1610,6 +1726,11 @@ class Selector:
             gain = c0 - cost(base - chosen) - PROBE_RATIO * (PROBE_START_S + acc)
             if gain > best_gain:
                 best, best_gain = i, gain
+        if os.environ.get("PROBE_VERBOSE"):
+            for est, n, job in jobs:
+                log(f"  job {num_to_test[n]['id']} est={est:.2f} ms={ms[n]} exp={job['exposure']} "
+                    f"full={len(job['full'])} cases={sum(len(v) for c in job['cases'].values() for v in c.values())}")
+            log(f"  base c0={c0:.1f} best={best} gain={best_gain:.2f} static={len(static)}")
         if best == 0:
             return static, "static" if static else "skip"
         pick = jobs[:best]
@@ -2158,8 +2279,12 @@ def main() -> None:
         log(patch.stem, len(chosen), " ".join(why))
 
 
-if __name__ == "__main__":
+def entry() -> None:
     if sys.argv[1:] == ["--bake"]:
         bake()
     else:
         main()
+
+
+if __name__ == "__main__":
+    entry()

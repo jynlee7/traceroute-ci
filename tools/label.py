@@ -18,7 +18,9 @@ answers = json.loads(ans_path.read_text()) if ans_path.exists() else {"commits":
 kinds = dict(l.split() for l in (out / "kinds.txt").read_text().splitlines())
 deselect = json.loads((out / "deselect.json").read_text()) if (out / "deselect.json").exists() else {}
 IGNORE = {n for t, n in num.items() if t.startswith("tests/test_sqlglotc.py")}
-line_re = re.compile(r"^(FAILED|ERROR|SUBFAILED\S*)\s+(\S+)")
+# SUBFAILED[<subtest title>] carries free text (spaces, commas) before the test id: take the
+# first tests/... token after the status, not the next whitespace-separated word.
+line_re = re.compile(r"^(FAILED|ERROR|SUBFAILED)\b.*?\s(tests/\S+)")
 order = (out / "order.txt").read_text().split() if (out / "order.txt").exists() else []
 rank = {c: i for i, c in enumerate(order)}
 for edit in sorted((out / "edits").glob("*.json"), key=lambda e: (rank.get(e.stem, 1e9), e.stem)):
@@ -35,6 +37,8 @@ for edit in sorted((out / "edits").glob("*.json"), key=lambda e: (rank.get(e.ste
     env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=str(w), PYTHONDONTWRITEBYTECODE="1")
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "8",
                         "--timeout", "900", "-rfE", "tests"] + [a for t in deselect.get(cid, []) for a in ("--deselect", t)], cwd=w, env=env, capture_output=True, text=True)
+    (out / "raw").mkdir(exist_ok=True)
+    (out / "raw" / f"{cid}.txt").write_text(r.stdout)  # re-parse later without re-running
     failing = set()
     for line in r.stdout.splitlines():
         m = line_re.match(line)
