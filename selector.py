@@ -335,13 +335,33 @@ class Selector:
                 return True
         return False
 
-    def fixture_tests(self, fixture_rel: str) -> set[int]:
-        """Tests whose strings name the fixture file (same matching as fixture_change)."""
-        stem = Path(fixture_rel).stem
+    def fixture_readers(self, fixture_rel: str) -> tuple[set[int], str]:
+        """Tests whose strings name the fixture file, and how they were found.
+
+        A string names it when its last path component is the file's name or stem ("simplify",
+        "optimizer/qualify_columns__invalid.sql", "tpc-h/tpc-h"). Directory strings that every test
+        of a class carries ("optimizer/" from a helper, "/optimizer/tpc-ds/" constants) don't, which
+        substring matching got wrong ("optimizer" matched all 60 TestExecutor tests). Substring
+        and directory matches remain as fallbacks when nothing names the file.
+        """
         memo = self.__dict__.setdefault("_fx_memo", {})
-        if stem not in memo:
-            memo[stem] = {n for n, strings in self.strings.items() if any(stem in s for s in strings)}
-        return set(memo[stem])
+        if fixture_rel not in memo:
+            path = Path(fixture_rel)
+            name, stem, parent = path.name, path.stem, path.parent.name
+            hits = {n for n, strings in self.strings.items() if any(s.rsplit("/", 1)[-1] in (name, stem) for s in strings)}
+            how = "fixture-name"
+            if not hits:
+                hits = {n for n, strings in self.strings.items() if any(stem in s for s in strings)}
+                how = "fixture-stem"
+            if not hits and parent:
+                hits = {n for n, strings in self.strings.items() if any(parent in s for s in strings)}
+                how = "fixture-dir"
+            memo[fixture_rel] = (frozenset(hits), how)
+        hits, how = memo[fixture_rel]
+        return set(hits), how
+
+    def fixture_tests(self, fixture_rel: str) -> set[int]:
+        return self.fixture_readers(fixture_rel)[0]
 
     def lambda_range(self, rel: str, line: int):
         best = None
@@ -375,15 +395,17 @@ class Selector:
             out |= {self.by_id[t] for t in tids if t in self.by_id}
         return out
 
-    def import_time_change(self, rel: str, line: int, extra_names: set[str] = frozenset()) -> set[int]:
+    def import_time_change(self, rel: str, line: int, extra_names: set[str] = frozenset(),
+                           import_safe: bool = False) -> set[int]:
         # Same answer for every line of one top-level class (or module level): memoise.
-        key = (rel, self.top_class(rel, line), frozenset(extra_names))
+        key = (rel, self.top_class(rel, line), frozenset(extra_names), import_safe)
         memo = self.__dict__.setdefault("_itc_memo", {})
         if key not in memo:
-            memo[key] = self._import_time_change(rel, line, extra_names)
+            memo[key] = self._import_time_change(rel, line, extra_names, import_safe)
         return set(memo[key])
 
-    def _import_time_change(self, rel: str, line: int, extra_names: set[str] = frozenset()) -> set[int]:
+    def _import_time_change(self, rel: str, line: int, extra_names: set[str] = frozenset(),
+                            import_safe: bool = False) -> set[int]:
         """A change to a class body or module level: it runs at import and is read from anywhere."""
         family = self.dialect_family(rel)
         hit: set[int] = set()
@@ -404,12 +426,20 @@ class Selector:
             hit |= by_name
         if rel.startswith(DIALECT_DIRS) or rel == "sqlglot/dialects/dialect.py":
             # Tests looping over every dialect name none, and see import-time dialect state.
-            # (test_generator_memory included: it loads every dialect, so an edit that breaks a
-            # dialect module's import fails it too.)
+            # Construct-only ones (test_generator_memory: builds every dialect's generator and
+            # measures memory, never reads the tables) can fail only if the import or the generator
+            # construction changes, so they are skipped when the edit is import-safe (see
+            # import_safe); the others assert on dialect values and always stay.
+            skip = set(self.index.get("construct_only_tests", ())) if import_safe else set()
             for tid in self.index.get("all_dialect_tests", []):
                 n = self.by_id.get(tid)
-                if n is not None:
+                if n is not None and tid not in skip:
                     hit.add(n)
+        if rel.startswith("sqlglot/executor/"):
+            # Module-level executor state (the ENV builtins table) is read by every executor test,
+            # including ones whose coverage never touches the edited module.
+            for f in ("sqlglot/executor/python.py", "sqlglot/generators/python.py"):
+                hit |= self.file_cov(f)
         return hit
 
     def test_module_reach(self, rel: str) -> set[int] | None:
@@ -431,6 +461,137 @@ class Selector:
         for m in seen:
             out |= self.by_file.get(m, set())
         return out or None
+
+    # -- proofs that an edit cannot matter
+
+    def equivalent_swap(self, old_tree, new_tree, rel: str) -> str | None:
+        """The only difference is one `is` <-> `==` (or `is not` <-> `!=`) swap that provably gives the
+        same result: a reason string, else None.
+
+        Against None: the left side's annotated type (and every ancestor and subclass of it) has
+        no __eq__/__ne__ that reads `other` without a type guard, so `x == None` is `x is None`.
+        Against a member of a pure Enum: the same type test. Against a member of a str/int-mixin
+        enum (where "UPPERCASE" == member): every value ever stored under that attribute name is a
+        member of that enum or None (index attr_enum), so equality is identity.
+        """
+        ix = self.index
+        if "eq_unsafe" not in ix:
+            return None
+        diffs = leaf_diffs(old_tree, new_tree)
+        if not diffs or len(diffs) != 1 or diffs[0][0] != "cmp":
+            return None
+        _, cmp_, new_cmp, i = diffs[0]
+        pair = (type(cmp_.ops[i]), type(new_cmp.ops[i]))
+        if pair not in {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}:
+            return None
+        left, right = ([cmp_.left] + cmp_.comparators)[i], cmp_.comparators[i]
+        if isinstance(left, ast.Constant) and left.value is None:
+            left, right = right, left
+        if isinstance(right, ast.Constant) and right.value is None:
+            return "is-none-swap" if self.eq_safe_type(old_tree, left, rel) else None
+        if isinstance(right, ast.Attribute) and isinstance(right.value, (ast.Name, ast.Attribute)):
+            enum = ast.unparse(right.value).split(".")[-1]
+            kind = ix.get("enum_kind", {}).get(enum)
+            if kind == "pure" and self.eq_safe_type(old_tree, left, rel):
+                return "is-enum-swap"
+            if kind == "mixin" and isinstance(left, ast.Attribute) and ix.get("attr_enum", {}).get(left.attr) == enum:
+                return "is-enum-member-swap"
+        return None
+
+    def eq_safe_type(self, tree, expr, rel: str) -> bool:
+        """expr's annotation names only classes whose equality against None or a pure enum member
+        is identity: builtins, or repo classes with no unguarded __eq__ in their whole hierarchy."""
+        ix = self.index
+        ann = None
+        if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name) and expr.value.id == "self":
+            ann = ix.get("attr_ann", {}).get(f"{rel}:{expr.attr}")
+        elif isinstance(expr, ast.Name):
+            for fn in ast.walk(tree):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.lineno <= expr.lineno <= fn.end_lineno:
+                    for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs:
+                        if a.arg == expr.id:
+                            ann = ast.unparse(a.annotation) if a.annotation is not None else None
+                            # A rebinding anywhere in the function voids the annotation as a proof.
+                            if any(isinstance(n, ast.Name) and n.id == expr.id and isinstance(n.ctx, ast.Store)
+                                   for n in ast.walk(fn)):
+                                return False
+        if not ann:
+            return False
+        names = set(re.findall(r"[A-Za-z_]\w*", ann)) - {
+            "t", "typing", "exp", "None", "Optional", "Union", "int", "str", "bool", "float", "bytes",
+            "list", "dict", "tuple", "set", "frozenset", "List", "Dict", "Tuple", "Set", "Sequence"}
+        bases, subs, unsafe = ix.get("class_bases", {}), ix.get("class_subs", {}), ix.get("eq_unsafe", {})
+        todo, seen = list(names), set()
+        while todo:
+            n = todo.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            if n in SAFE_BUILTIN_BASES:
+                continue  # their __eq__ returns NotImplemented for a foreign right side
+            if n not in bases:
+                return False  # Any, a TypeVar, a third-party or unknown class: no proof
+            if unsafe.get(n):
+                return False
+            todo.extend(bases.get(n, ()))
+            todo.extend(subs.get(n, ()))
+            if len(seen) > 2000:
+                return False
+        return True
+
+    def import_safe(self, old_tree, new_tree, rel: str) -> bool:
+        """The edit only swaps literal values in a way that cannot change what importing the module or
+        building a generator does: each changed constant keeps its type, is not a dict key, and sits
+        in displays (dict/list/tuple/set, unary +/-) of a class-body or module-level assignment whose
+        target building a generator never reads; it keeps its truthiness unless it is only captured
+        by a closure factory (_show_parser("X", target=True)) or a lambda body."""
+        ix = self.index
+        if rel == "sqlglot/dialects/dialect.py" or "gen_init_attrs" not in ix or "closure_factories" not in ix:
+            return False
+        diffs = leaf_diffs(old_tree, new_tree)
+        if not diffs or any(d[0] != "const" for d in diffs):
+            return False
+        parents = {}
+        for p in ast.walk(old_tree):
+            for c in ast.iter_child_nodes(p):
+                parents[id(c)] = p
+        factories, gen_attrs = set(ix["closure_factories"]), set(ix["gen_init_attrs"])
+        for _, a, b in diffs:
+            if type(a.value) is not type(b.value) or type(a.value) not in (int, float, str, bool, bytes):
+                return False
+            node, deferred = a, False
+            while True:
+                p = parents.get(id(node))
+                if p is None:
+                    return False
+                if isinstance(p, ast.Dict):
+                    if any(k is node for k in p.keys):
+                        return False  # a key changed: lookups and registrations change
+                elif isinstance(p, ast.Lambda):
+                    if node is not p.body:
+                        return False  # a default argument
+                    deferred = True
+                elif isinstance(p, ast.Call):
+                    if node is p.func or call_name(p) not in factories:
+                        return False
+                    deferred = True
+                elif isinstance(p, ast.UnaryOp):
+                    if not isinstance(p.op, (ast.USub, ast.UAdd)):
+                        return False
+                elif isinstance(p, ast.stmt):
+                    holder = parents.get(id(p))
+                    if not isinstance(p, (ast.Assign, ast.AnnAssign)) or not isinstance(holder, (ast.ClassDef, ast.Module)):
+                        return False
+                    targets = p.targets if isinstance(p, ast.Assign) else [p.target]
+                    if any(not isinstance(tg, ast.Name) or tg.id in gen_attrs for tg in targets):
+                        return False
+                    if not deferred and bool(a.value) != bool(b.value):
+                        return False
+                    break
+                elif not isinstance(p, (ast.List, ast.Tuple, ast.Set, ast.keyword)):
+                    return False
+                node = p
+        return True
 
     # -- per kind of file
 
@@ -474,6 +635,10 @@ class Selector:
                             return reach, "bytes-suspect-test"
                     return set(self.all), "bytes-suspect"
                 return set(), how
+            if rel.startswith("sqlglot/") and not rel.startswith("sqlglot/typing/") and bytes_inert(f):
+                why = self.equivalent_swap(old_tree, new_tree, rel)
+                if why:
+                    return set(), why
         if rel.startswith("tests/"):
             return self.test_file_change(f, old), "test-file"
         if not rel.startswith("sqlglot/"):
@@ -494,11 +659,24 @@ class Selector:
             for c in old_names.keys() | new_names_.keys():
                 if old_names.get(c) != new_names_.get(c):
                     renamed |= old_names.get(c, set()) | new_names_.get(c, set())
+        headers = def_headers(old_tree)
+        safe = None  # import_safe(), computed on first module-level line
         out: set[int] = set()
         reasons = []
         for ln in sorted(changed):
             fn, cls = self.innermost(rel, ln)
-            if fn and self.in_import_fn(rel, ln):
+            if fn and ln in headers:
+                # Defaults and decorators run when the def runs, so coverage credits them to whichever
+                # test imported the module first (lazily loaded optimizer/executor/dialect modules).
+                # They matter to every call: take the whole function's tests, nested closures
+                # included (a factory's default reaches its closure's callers). Never pruned.
+                s, e = headers[ln]
+                hit = self.cov(rel, range(s, e + 1))
+                if not hit:
+                    hit = self.import_time_change(rel, ln) or set(self.all)
+                out |= hit
+                reasons.append("def-header")
+            elif fn and self.in_import_fn(rel, ln):
                 # Runs at import or class creation (hooks, metaclasses, helpers they call):
                 # coverage only credits whichever test imported first.
                 hit = self.import_time_change(rel, ln) | self.cov(rel, range(fn[0], fn[1] + 1))
@@ -529,6 +707,11 @@ class Selector:
                         # treat it like a module-level edit; if nothing claims it, run everything.
                         hit = self.import_time_change(rel, ln) or set(self.all)
                         reasons.append("fn-import-only")
+                    elif not table:
+                        # The file was never measured (no line of it recorded): no coverage proof
+                        # that nothing runs it. Treat it like a module-level edit, else run everything.
+                        hit = self.import_time_change(rel, ln) or set(self.all)
+                        reasons.append("fn-unmeasured")
                 out |= hit
                 reasons.append("fn")
             else:
@@ -548,11 +731,13 @@ class Selector:
                 if rel.endswith("__init__.py"):
                     # Package init: re-exports and lazy dialect loading reach everything.
                     return set(self.all), "package-init"
-                hit = self.import_time_change(rel, ln, renamed)
+                if safe is None:
+                    safe = self.import_safe(old_tree, new_tree, rel)
+                hit = self.import_time_change(rel, ln, renamed, safe)
                 if not hit:
                     return set(self.all), "module-level-unmapped"
                 out |= hit
-                reasons.append("module")
+                reasons.append("module-safe" if safe else "module")
         lost = module_bound(old_tree) - module_bound(new_tree)
         if lost:
             # Another sqlglot module importing it, or naming the class (exp.Foo in a table), fails
@@ -571,6 +756,12 @@ class Selector:
                 out |= self.test_module_reach(m) or set(self.by_file.get(m, set()))
             if users:
                 reasons.append("lost-import")
+        # A removed class attribute or method that another module reads as Cls.attr (a deleted
+        # TokenType member, a dropped flag) breaks that module's import, and with it `import sqlglot`.
+        qualified = self.index.get("qualified_attrs", {})
+        for owner, n in class_bound(old_tree) - class_bound(new_tree):
+            if any(f2 != rel for f2 in qualified.get(f"{owner}.{n}", ())):
+                return set(self.all), "sqlglot:lost-class-attr"
         new_names = def_names(new_tree) - def_names(old_tree)
         if new_names:
             # A new or renamed method can override a parent's or be found by name
@@ -630,13 +821,12 @@ class Selector:
         if path.suffix == ".sql" and f["old"] and f["new"] and sql_comment_only(f):
             # tests/helpers.py's fixture loaders drop empty lines and lines starting with "--".
             return set(), "fixture-comment"
-        stem, parent = path.stem, path.parent.name
-        hits = {n for n, strings in self.strings.items() if any(stem in s for s in strings)}
+        hits, how = self.fixture_readers(f["path"])
+        if f["old"] and f["old"] != f["path"]:
+            more, _ = self.fixture_readers(f["old"])  # readers of the old name break too
+            hits |= more
         if hits:
-            return hits, "fixture-stem"
-        hits = {n for n, strings in self.strings.items() if any(parent in s for s in strings)}
-        if hits:
-            return hits, "fixture-dir"
+            return hits, how
         return set(self.all), "fixture-unmapped"
 
     def select(self, files: list[dict]) -> tuple[set[int], list[str]]:
@@ -671,6 +861,85 @@ class Selector:
             out |= s
             why.append(f"{rel}:{r}:{len(s)}")
         return out, why
+
+
+SAFE_BUILTIN_BASES = {"object", "Generic", "ABC", "Protocol", "Exception", "ValueError", "TypeError",
+                      "KeyError", "RuntimeError"}
+SWAP_OPS = (ast.cmpop, ast.operator, ast.unaryop, ast.boolop)
+
+
+def leaf_diffs(a, b) -> list[tuple] | None:
+    """Where two same-shaped trees differ: ("const", old, new) for Constant values, ("cmp", old_compare,
+    new_compare, i) for the i-th comparison operator, ("op", old, new) for other operators.
+    None when they differ in any other way (shape, names, attributes...)."""
+    wa, wb = list(ast.walk(a)), list(ast.walk(b))
+    if len(wa) != len(wb):
+        return None
+    out: list[tuple] = []
+    for x, y in zip(wa, wb):
+        if type(x) is not type(y):
+            if isinstance(x, ast.cmpop) and isinstance(y, ast.cmpop):
+                continue  # recorded on the Compare (operator nodes are shared singletons)
+            if any(isinstance(x, k) and isinstance(y, k) for k in SWAP_OPS[1:]):
+                out.append(("op", x, y))
+                continue
+            return None
+        if isinstance(x, ast.Compare):
+            for i, (ox, oy) in enumerate(zip(x.ops, y.ops)):
+                if type(ox) is not type(oy):
+                    out.append(("cmp", x, y, i))
+        for field, vx in ast.iter_fields(x):
+            vy = getattr(y, field, None)
+            if isinstance(vx, ast.AST):
+                continue
+            if isinstance(vx, list):
+                if not isinstance(vy, list) or len(vx) != len(vy):
+                    return None
+                if [v for v in vx if not isinstance(v, ast.AST)] != [v for v in vy if not isinstance(v, ast.AST)]:
+                    return None
+                continue
+            if type(vx) is not type(vy) or vx != vy:
+                if isinstance(x, ast.Constant) and field == "value":
+                    out.append(("const", x, y))
+                    continue
+                return None
+    return out
+
+
+def call_name(c: ast.Call) -> str | None:
+    fn = c.func
+    return fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
+
+
+def def_headers(tree) -> dict[int, tuple[int, int]]:
+    """Old line -> (start, end) of the function whose header (decorators, signature, defaults) holds it."""
+    out: dict[int, tuple[int, int]] = {}
+    if tree is None:
+        return out
+    for n in ast.walk(tree):  # outer first, so nested defs overwrite
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = min([n.lineno] + [d.lineno for d in n.decorator_list])
+            # strip_docstrings may leave a bare Pass with no position as the only statement.
+            first = next((s.lineno for s in n.body if getattr(s, "lineno", None)), n.end_lineno + 1)
+            for ln in range(start, first):
+                out[ln] = (start, n.end_lineno)
+    return out
+
+
+def class_bound(tree) -> set[tuple[str, str]]:
+    """(class, attribute) for every name a class body binds, at any nesting."""
+    out: set[tuple[str, str]] = set()
+    if tree is None:
+        return out
+    for c in ast.walk(tree):
+        if isinstance(c, ast.ClassDef):
+            for s in c.body:
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    out.add((c.name, s.name))
+                for tg in (s.targets if isinstance(s, ast.Assign) else [s.target] if isinstance(s, ast.AnnAssign) else []):
+                    if isinstance(tg, ast.Name):
+                        out.add((c.name, tg.id))
+    return out
 
 
 CAMEL = re.compile(r"(?<!^)(?=[A-Z])")  # same as sqlglot.helper.CAMEL_CASE_PATTERN

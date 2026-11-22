@@ -38,6 +38,13 @@ def sql_names_of(cls: ast.ClassDef) -> set[str]:
     return out
 
 
+def names_fixture(strings, name: str, stem: str) -> bool:
+    """A string names the fixture when its last path component is the file's name or stem:
+    "simplify", "optimizer/qualify_columns__invalid.sql", "tpc-h/tpc-h". A directory string such as
+    "optimizer/" or "/optimizer/tpc-ds/" does not (same rule as selector.py)."""
+    return any(s.rsplit("/", 1)[-1] in (name, stem) for s in strings)
+
+
 def scan_call_tests(root: Path, wanted: set[str]) -> dict[str, list]:
     """SQL function name -> test ids whose strings (any length) or fixtures call it.
     "*" marks a fixture calling it that no test can be tied to."""
@@ -81,7 +88,8 @@ def scan_call_tests(root: Path, wanted: set[str]) -> dict[str, list]:
                 continue
             if not words:
                 continue
-            users = ({t for t, ss in strings_of.items() if any(p.stem in s for s in ss)}
+            users = ({t for t, ss in strings_of.items() if names_fixture(ss, p.name, p.stem)}
+                     or {t for t, ss in strings_of.items() if any(p.stem in s for s in ss)}
                      or {t for t, ss in strings_of.items() if any(p.parent.name in s for s in ss)} or {"*"})
             for w in words:
                 calls.setdefault(w, set()).update(users)
@@ -171,11 +179,42 @@ def build(root: Path) -> dict:
                 if f and f != rel:
                     rdeps.setdefault(f, set()).add(rel)
 
+    # Factories another module calls at its own import time (a dialect's class body calling a helper
+    # from dialect.py or transforms.py): their own lines run at import, so seed them in their file.
+    top_calls: dict[str, set] = {}
+    for rel, tree in trees.items():
+        names, todo = set(), list(ast.iter_child_nodes(tree))
+        while todo:
+            n = todo.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(n, ast.Call):
+                fnode = n.func
+                nm = fnode.id if isinstance(fnode, ast.Name) else fnode.attr if isinstance(fnode, ast.Attribute) else None
+                if nm:
+                    names.add(nm)
+            todo.extend(ast.iter_child_nodes(n))
+        top_calls[rel] = names
+    # Only dialect modules' import-time calls (class-body tables built with dialect.py/transforms.py
+    # factories): seeding every module-level call would mark busy runtime helpers (builders, helper)
+    # as import-time and widen their edits to whole-file coverage.
+    dialect_dirs = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/tokenizers/", "sqlglot/typing/")
+    xseeds: dict[str, set] = {}
+    for key, importers in internal_names.items():
+        src, name = key.rsplit(":", 1)
+        if any(imp.startswith(dialect_dirs) and name in top_calls.get(imp, ()) for imp in importers):
+            xseeds.setdefault(src, set()).add(name)
+
     # Functions that run at import / class creation: hooks (__init_subclass__, __set_name__,
     # a metaclass __new__), anything called outside a def or lambda, and their same-file callees.
     # Coverage credits their lines only to whichever test imported first.
     import_fns: dict[str, list] = {}
     for rel, tree in trees.items():
+        module_names = set()  # names bound at module level (caches live here)
+        for st in tree.body:
+            for tg in (st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, ast.AnnAssign) else []):
+                if isinstance(tg, ast.Name):
+                    module_names.add(tg.id)
         defs: dict[str, list] = {}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -223,14 +262,36 @@ def build(root: Path) -> dict:
                 scan(ch)
 
         scan(tree)
+        seeds |= xseeds.get(rel, set())
         # Run-once functions: caches and lazily built dispatch tables run on first use in each
-        # worker process, so coverage credits them to whichever test came first.
+        # worker process, so coverage credits them to whichever test came first. A function whose
+        # result its caller stores in a module-level cache (_DISPATCH_CACHE[cls] = _build_dispatch(cls))
+        # is one of them; a name prefix is not evidence (most _build*/_builder run on every parse).
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            made_by: dict[str, set] = {}  # local name -> functions whose calls produced it
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and callee(n.value):
+                    for tg in n.targets:
+                        if isinstance(tg, ast.Name):
+                            made_by.setdefault(tg.id, set()).add(callee(n.value))
+            for n in ast.walk(fn):
+                if not isinstance(n, ast.Assign):
+                    continue
+                cached = any(isinstance(tg, ast.Subscript) and isinstance(tg.value, ast.Name)
+                             and tg.value.id in module_names for tg in n.targets)
+                if not cached:
+                    continue
+                if isinstance(n.value, ast.Call) and callee(n.value):
+                    seeds.add(callee(n.value))
+                elif isinstance(n.value, ast.Name) and n.value.id in made_by:
+                    seeds |= made_by[n.value.id]
         for name, nodes in defs.items():
             for d in nodes:
                 deco = {(x.func if isinstance(x, ast.Call) else x) for x in d.decorator_list}
                 deco_names = {x.attr if isinstance(x, ast.Attribute) else getattr(x, "id", "") for x in deco}
                 once = bool(deco_names & {"cache", "lru_cache", "cached_property", "cache_info"})
-                once = once or name.startswith("_build")
                 for n in ast.walk(d):
                     if isinstance(n, (ast.Global, ast.Nonlocal)):
                         once = True
@@ -417,7 +478,25 @@ def build(root: Path) -> dict:
     for name in class_names:
         refs.setdefault(name, []).extend(sql_methods.get(f"{name.lower()}_sql", []))
 
+    # "Cls.attr" -> files reading it that way: deleting that class attribute breaks those files.
+    qualified_attrs: dict[str, set] = {}
+    for rel, tree in trees.items():
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute):
+                v = n.value
+                owner = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else None
+                if owner in class_names:
+                    qualified_attrs.setdefault(f"{owner}.{n.attr}", set()).add(rel)
+
+    extra: dict = {"qualified_attrs": {k: sorted(v) for k, v in qualified_attrs.items()}}
+    for part in (eq_tables, construct_tables):
+        try:
+            extra.update(part(root, trees, all_dialect_tests))
+        except Exception as e:  # optional tables: the selector refuses the rules that need them
+            print(f"{part.__name__} failed: {type(e).__name__}: {e}", file=sys.stderr)
+
     return {
+        **extra,
         "toplevel": toplevel,
         "lambdas": lambdas,
         "refs": refs,
@@ -432,6 +511,228 @@ def build(root: Path) -> dict:
         **({"calls": {k: sorted(v) for k, v in calls.items()}, "call_tests": call_tests}
            if call_tests is not None else {}),
         "fixture_dialects": fixture_dialects,
+    }
+
+
+def _parse_tests(root: Path) -> dict[str, ast.AST]:
+    out = {}
+    for p in sorted((root / "tests").rglob("*.py")):
+        if "fixtures" in p.parts:
+            continue
+        try:
+            out[str(p.relative_to(root))] = ast.parse(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return out
+
+
+ENUM_BASES = {"Enum", "AutoName", "IntEnum", "StrEnum", "Flag", "IntFlag"}
+MIXIN_BASES = {"str", "int", "IntEnum", "StrEnum", "IntFlag", "float", "bytes"}
+
+
+def eq_tables(root: Path, trees: dict, _all_dialect_tests) -> dict:
+    """Facts for proving an `is` <-> `==` swap equivalent (selector.equivalent_swap):
+      eq_unsafe    class -> True when its __eq__/__ne__ reads `other` without a type guard
+      class_bases  class -> base names (sqlglot and tests); class_subs the reverse
+      enum_kind    enum class -> "pure" | "mixin" (str/int mixins compare equal to raw values)
+      attr_ann     "file:attr" -> annotation of `self.attr: T` (any method of that file)
+      attr_enum    attr -> enum name when every value ever stored under that attribute name
+                   (sqlglot and tests: `x.attr = v`, class-body `attr = v`, `attr=` keywords) is a
+                   member of that one enum, a call of it, None, or self.OTHER that passes too
+    """
+    files = dict(trees)
+    files.update(_parse_tests(root))
+    eq_unsafe: dict[str, bool] = {}
+    bases_of: dict[str, set] = {}
+    enums: dict[str, str] = {}
+    ann: dict[str, str] = {}
+    assigns: dict[str, list] = {}
+    dynamic: set[str] = set()  # attribute names set through setattr / __dict__ with a literal name
+
+    def unsafe(fn) -> bool:
+        if len(fn.args.args) < 2:
+            return True
+        other = fn.args.args[1].arg
+        src = ast.unparse(fn)
+        guarded = "isinstance(" in src or "type(" in src
+        touches = any(isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.value, ast.Name)
+                      and n.value.id == other for n in ast.walk(fn))
+        return touches and not guarded
+
+    pending = []
+    for rel, tree in files.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                bnames = {ast.unparse(b.value if isinstance(b, ast.Subscript) else b).split(".")[-1]
+                          for b in node.bases}
+                bases_of.setdefault(node.name, set()).update(bnames)
+                pending.append((node.name, bnames))
+                for it in node.body:
+                    if isinstance(it, (ast.FunctionDef, ast.AsyncFunctionDef)) and it.name in ("__eq__", "__ne__"):
+                        eq_unsafe[node.name] = eq_unsafe.get(node.name, False) or unsafe(it)
+                    elif isinstance(it, (ast.Assign, ast.AnnAssign)) and it.value is not None:
+                        for tg in (it.targets if isinstance(it, ast.Assign) else [it.target]):
+                            if isinstance(tg, ast.Name):
+                                assigns.setdefault(tg.id, []).append(it.value)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                for tg in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    if isinstance(tg, ast.Attribute):
+                        assigns.setdefault(tg.attr, []).append(
+                            node.value if node.value is not None and not isinstance(node, ast.AugAssign) else None)
+                        if isinstance(node, ast.AnnAssign) and isinstance(tg.value, ast.Name) and tg.value.id == "self":
+                            ann[f"{rel}:{tg.attr}"] = ast.unparse(node.annotation)
+                    elif isinstance(tg, ast.Subscript) and isinstance(tg.value, ast.Attribute) and tg.value.attr == "__dict__":
+                        dynamic.add("*")
+            elif isinstance(node, ast.keyword) and node.arg:
+                assigns.setdefault(node.arg, []).append(node.value)
+            elif isinstance(node, ast.Call) and getattr(node.func, "id", "") in ("setattr", "delattr"):
+                if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                    dynamic.add(node.args[1].value)
+                else:
+                    dynamic.add("*")  # computed attribute names: no provenance proof anywhere
+
+    changed = True
+    while changed:  # enums subclassing enums
+        changed = False
+        for name, bnames in pending:
+            if name in enums:
+                continue
+            if bnames & ENUM_BASES or any(b in enums for b in bnames):
+                mixin = bool(bnames & MIXIN_BASES) or any(enums.get(b) == "mixin" for b in bnames)
+                enums[name] = "mixin" if mixin else "pure"
+                changed = True
+
+    def member_of(v, seen) -> str | None:
+        """The enum v is a member of ("" for None), or None when unknown."""
+        if v is None:
+            return None
+        if isinstance(v, ast.Constant) and v.value is None:
+            return ""
+        if isinstance(v, ast.Call):
+            head = ast.unparse(v.func).split(".")[-1]
+            return head if head in enums else None
+        if isinstance(v, ast.Attribute):
+            if isinstance(v.value, ast.Name) and v.value.id in ("self", "cls"):
+                return attr_enum(v.attr, seen)
+            head = ast.unparse(v.value).split(".")[-1]
+            return head if head in enums else None
+        return None
+
+    memo: dict[str, str | None] = {}
+
+    def attr_enum(attr, seen) -> str | None:
+        if attr in memo:
+            return memo[attr]
+        if attr in seen:
+            return ""  # a cycle adds no new values
+        if "*" in dynamic or attr in dynamic or not assigns.get(attr):
+            return None
+        kinds = set()
+        for v in assigns[attr]:
+            k = member_of(v, seen | {attr})
+            if k is None:
+                if not seen:
+                    memo[attr] = None
+                return None
+            kinds.add(k)
+        kinds.discard("")
+        res = kinds.pop() if len(kinds) == 1 else None
+        if not seen:
+            memo[attr] = res
+        return res
+
+    attr_enum_map = {}
+    for a in assigns:
+        if a.isidentifier():
+            e = attr_enum(a, frozenset())
+            if e:
+                attr_enum_map[a] = e
+    subs_all: dict[str, set] = {}
+    for c, bs in bases_of.items():
+        for b in bs:
+            subs_all.setdefault(b, set()).add(c)
+    return {
+        "eq_unsafe": eq_unsafe,
+        "class_bases": {k: sorted(v) for k, v in bases_of.items()},
+        "class_subs": {k: sorted(v) for k, v in subs_all.items()},
+        "enum_kind": enums,
+        "attr_ann": ann,
+        "attr_enum": attr_enum_map,
+    }
+
+
+def construct_tables(root: Path, trees: dict, all_dialect_tests) -> dict:
+    """Facts for skipping construct-only tests on edits that cannot fail at import:
+      closure_factories  names whose every definition only defines and returns a closure
+      gen_init_attrs     attribute names read while building a generator (Generator.__init__,
+                         Dialect.generator): a value there can change construction behaviour
+      construct_only_tests  all-dialect tests that only build objects and measure memory
+                         (tracemalloc), never parsing or generating SQL from the edited tables
+    """
+    factory: dict[str, bool] = {}
+    for tree in trees.values():
+        for n in ast.walk(tree):
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = list(n.body)
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                body = body[1:]  # docstring
+            ok = len(body) >= 2 and isinstance(body[-1], ast.Return) and body[-1].value is not None
+            if ok:
+                defined = set()
+                for st in body[:-1]:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        defined.add(st.name)
+                    elif isinstance(st, ast.Assign) and isinstance(st.value, ast.Lambda) and \
+                            all(isinstance(tg, ast.Name) for tg in st.targets):
+                        defined.update(tg.id for tg in st.targets)
+                    else:
+                        ok = False
+                        break
+                ret = body[-1].value
+                ok = ok and (isinstance(ret, ast.Lambda) or (isinstance(ret, ast.Name) and ret.id in defined))
+            factory[n.name] = factory.get(n.name, True) and ok
+    gen_attrs: set[str] = set()
+    for rel, cls_name, fn_name in (("sqlglot/generator.py", "Generator", "__init__"),
+                                   ("sqlglot/dialects/dialect.py", "Dialect", "generator")):
+        tree = trees.get(rel)
+        if tree is None:
+            raise ValueError(f"{rel} missing")
+        found = False
+        for c in tree.body:
+            if isinstance(c, ast.ClassDef) and c.name == cls_name:
+                for it in c.body:
+                    if isinstance(it, ast.FunctionDef) and it.name == fn_name:
+                        found = True
+                        gen_attrs |= {a.attr for a in ast.walk(it) if isinstance(a, ast.Attribute)}
+                        gen_attrs |= {k.arg for k in ast.walk(it) if isinstance(k, ast.keyword) and k.arg}
+        if not found:
+            raise ValueError(f"{cls_name}.{fn_name} missing")
+    tests = _parse_tests(root)
+    construct_only = []
+    sql_calls = {"sql", "transpile", "parse", "parse_one", "validate_identity", "validate_all",
+                 "generate", "tokenize", "optimize", "execute"}
+    for tid in all_dialect_tests:
+        rel, *rest = tid.split("::")
+        tree = tests.get(rel)
+        if tree is None:
+            continue
+        node = tree
+        for part in rest:
+            node = next((c for c in getattr(node, "body", []) if isinstance(c, (ast.ClassDef, ast.FunctionDef))
+                         and c.name == part), None)
+            if node is None:
+                break
+        if node is None:
+            continue
+        names = {n.attr if isinstance(n, ast.Attribute) else n.id for n in ast.walk(node)
+                 if isinstance(n, (ast.Attribute, ast.Name))}
+        if "tracemalloc" in names and not names & sql_calls:
+            construct_only.append(tid)
+    return {
+        "closure_factories": sorted(k for k, v in factory.items() if v),
+        "gen_init_attrs": sorted(gen_attrs),
+        "construct_only_tests": construct_only,
     }
 
 

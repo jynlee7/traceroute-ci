@@ -153,3 +153,20 @@ All 20 reports are in `research/`. Merged into `selector.py`, `tools/build_index
 - **Build:** no apt or git (GitHub archive fetch); the index build can't fail the image; a bad map runs everything.
 
 **Next:** rebuild the map → `tools/eval.sh` → `make sample` → fix → commit → make the repo public. Deferred: agent 13 bake (CPU), agent 01 parser-table narrowing, agent 14 coverage re-runs (import flag, setUpClass broadcast, reversed-order run).
+
+### 2026-11-22: round 2, Tier 0 + Tier 1 implemented (code only, not run)
+Plan: `research/r2/PLAN.md` (22 reports in `research/r2/`). Changes:
+- **Recall:**
+  - R1: def/decorator/default lines take the whole function's coverage (`def_headers`), and are never pruned.
+  - R2: `|setup` (setUpClass) coverage goes to every test in the class (`build_map.py`; needs a map rebuild).
+  - R3: a function edit in an unmeasured file goes to the import-time rule, else runs everything (no more `[]`).
+  - R4: a removed class attribute or method that another module reads as `Cls.attr` runs everything (`qualified_attrs`).
+  - R5: dialect class-body factories from other modules are seeded as import-time; executor module edits add the executor files' coverage.
+- **Cost:**
+  - C1: fixtures are matched by the last path component of a test string (substring and directory only as fallbacks), in both `selector.py` and `build_index.scan_call_tests`.
+  - C2: the `_build*` name prefix no longer marks import-time functions; they are seeded only when their result is stored in a module-level cache.
+  - C3: an `is`<->`==` swap is `[]` when it is proven equivalent (None vs a type with no unguarded `__eq__`; a pure enum; or a mixin enum whose attribute only ever holds members). Uses the index tables `eq_unsafe`, `class_bases`/`class_subs`, `enum_kind`, `attr_ann`, `attr_enum`.
+  - C4: construct-only all-dialect tests (`test_generator_memory`) are skipped for import-safe literal swaps (`import_safe`: `closure_factories`, `gen_init_attrs`, `construct_only_tests`).
+- Expected on the sample: ~217.7 -> ~130-140 s simulated (Tier 2 is needed for ~115 s). Not measured.
+
+**Next:** rebuild the map (`python tools/build_map.py`, for R2) → `tools/eval.sh` → `make sample` → confirm 0 misses and check the `why.log` reasons (`is-*-swap`, `module-safe`, `fixture-name`, `def-header`).

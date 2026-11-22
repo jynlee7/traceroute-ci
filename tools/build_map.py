@@ -88,6 +88,14 @@ def main() -> None:
             set_table.append(list(key))
         return set_ids[key]
 
+    # setUpClass runs in the setup phase of whichever test of the class comes first, but its work
+    # (tables, schemas, parsed fixtures) is shared by every test of the class: a mutant there errors
+    # them all. Give lines seen in a "|setup" context to the whole class.
+    class_tests: dict[str, set[int]] = defaultdict(set)
+    for tid, i in index.items():
+        if tid.count("::") == 2:
+            class_tests[tid.rsplit("::", 1)[0]].add(i)
+
     files = {}
     unmatched = set()
     for measured in sorted(data.measured_files()):
@@ -102,9 +110,13 @@ def main() -> None:
             for ctx in contexts:
                 if not ctx:
                     continue
-                tid = ctx.rsplit("|", 1)[0]
+                tid, _, phase = ctx.rpartition("|")
+                if not tid:
+                    tid, phase = ctx, ""
                 if tid in index:
                     tests.add(index[tid])
+                    if phase == "setup" and tid.count("::") == 2:
+                        tests |= class_tests[tid.rsplit("::", 1)[0]]
                 else:
                     unmatched.add(tid)
             lines[str(lineno)] = intern(tests)
